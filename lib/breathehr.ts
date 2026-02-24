@@ -1,4 +1,3 @@
-import fetch from 'node-fetch';
 import { getConfig } from './config';
 import {
   BreatheEmployee,
