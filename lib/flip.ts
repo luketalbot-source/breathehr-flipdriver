@@ -160,7 +160,7 @@ export class FlipClient {
     externalId?: string;
     page?: number;
     limit?: number;
-  }): Promise<{ items: FlipUser[]; pagination: Record<string, unknown> }> {
+  }): Promise<{ users: FlipUser[]; pagination: Record<string, unknown> }> {
     const queryParams: Record<string, string> = {};
 
     if (params?.searchTerm) queryParams.search_term = params.searchTerm;
@@ -192,8 +192,8 @@ export class FlipClient {
         limit: 1,
       });
 
-      if (result.items && result.items.length > 0) {
-        return result.items[0];
+      if (result.users && result.users.length > 0) {
+        return result.users[0];
       }
       return null;
     } catch (error) {
@@ -212,7 +212,7 @@ export class FlipClient {
 
     while (hasMore) {
       const result = await this.searchUsers({ page, limit: 100 });
-      const users = result.items || [];
+      const users = result.users || [];
       allUsers.push(...users);
       hasMore = users.length === 100;
       page++;
