@@ -11,20 +11,87 @@ import {
 /**
  * Flip API Client
  *
- * Auth: Bearer token
+ * Auth: OAuth2 Client Credentials → JWT Bearer token
+ * Token URL: https://{domain}/auth/realms/{org}/protocol/openid-connect/token
  * Base URL: configured per tenant
  */
 export class FlipClient {
-  private apiToken: string;
   private clientId: string;
+  private clientSecret: string;
   private baseUrl: string;
+  private organization: string;
+
+  // Token cache
+  private accessToken: string | null = null;
+  private tokenExpiresAt: number = 0;
 
   constructor() {
     const config = getConfig();
-    this.apiToken = config.flip.apiToken;
     this.clientId = config.flip.clientId;
+    this.clientSecret = config.flip.clientSecret;
     this.baseUrl = config.flip.baseUrl;
+    this.organization = config.flip.organization;
   }
+
+  // ============================================================
+  // OAuth2 Token Management
+  // ============================================================
+
+  /**
+   * Get a valid access token, refreshing if needed.
+   * Uses OAuth2 client_credentials grant.
+   */
+  private async getAccessToken(): Promise<string> {
+    // Return cached token if still valid (with 30s buffer)
+    if (this.accessToken && Date.now() < this.tokenExpiresAt - 30000) {
+      return this.accessToken;
+    }
+
+    const tokenUrl = `${this.baseUrl}/auth/realms/${this.organization}/protocol/openid-connect/token`;
+
+    console.log(`[Flip Auth] Requesting token from ${tokenUrl}`);
+
+    const body = new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: this.clientId,
+      client_secret: this.clientSecret,
+    });
+
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: body.toString(),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error(`[Flip Auth] Token request failed ${response.status}: ${errorBody}`);
+      throw new Error(
+        `Flip OAuth2 token request failed: ${response.status} ${response.statusText} - ${errorBody}`
+      );
+    }
+
+    const tokenData = await response.json() as {
+      access_token: string;
+      expires_in: number;
+      token_type: string;
+    };
+
+    this.accessToken = tokenData.access_token;
+    this.tokenExpiresAt = Date.now() + tokenData.expires_in * 1000;
+
+    console.log(
+      `[Flip Auth] Token acquired, expires in ${tokenData.expires_in}s`
+    );
+
+    return this.accessToken;
+  }
+
+  // ============================================================
+  // HTTP Request Helper
+  // ============================================================
 
   private async request<T>(
     method: string,
@@ -32,6 +99,8 @@ export class FlipClient {
     body?: unknown,
     queryParams?: Record<string, string>
   ): Promise<T> {
+    const token = await this.getAccessToken();
+
     let url = `${this.baseUrl}${path}`;
 
     if (queryParams) {
@@ -40,9 +109,8 @@ export class FlipClient {
     }
 
     const headers: Record<string, string> = {
-      'Authorization': `Bearer ${this.apiToken}`,
+      'Authorization': `Bearer ${token}`,
       'Accept': 'application/json',
-      'X-Flip-Client-Id': this.clientId,
     };
 
     const options: Record<string, unknown> = { method, headers };
