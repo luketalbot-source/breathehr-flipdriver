@@ -120,22 +120,13 @@ export class UserMappingService {
 
   /**
    * Extract the reference number from a BreatheHR employee.
-   * Tries multiple possible field names since the API docs are ambiguous.
+   * The field is called "employee_ref" in the BreatheHR API.
    */
   private extractRef(employee: BreatheEmployee): string | null {
-    // Try the most likely field names
-    const candidates = [
-      employee.employee_number,
-      employee.reference,
-      (employee as Record<string, unknown>).ref as string | undefined,
-      (employee as Record<string, unknown>).employee_ref as string | undefined,
-      (employee as Record<string, unknown>).employee_reference as string | undefined,
-    ];
+    const ref = (employee as Record<string, unknown>).employee_ref as string | undefined;
 
-    for (const value of candidates) {
-      if (value !== undefined && value !== null && String(value).trim() !== '') {
-        return String(value).trim();
-      }
+    if (ref !== undefined && ref !== null && String(ref).trim() !== '') {
+      return String(ref).trim();
     }
 
     return null;
