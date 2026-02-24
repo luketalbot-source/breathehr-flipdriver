@@ -187,7 +187,7 @@ export class FlipClient {
   async findUserByExtHRRef(extHRRef: string): Promise<FlipUser | null> {
     try {
       const result = await this.searchUsers({
-        attributeName: 'ExtHRRef',
+        attributeName: 'exthrref',
         attributeValue: extHRRef,
         limit: 1,
       });

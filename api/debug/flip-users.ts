@@ -25,7 +25,7 @@ export default async function handler(
     if (ref) {
       console.log(`[Debug] Searching Flip users with ExtHRRef="${ref}"`);
       const byAttribute = await flip.searchUsers({
-        attributeName: 'ExtHRRef',
+        attributeName: 'exthrref',
         attributeValue: ref,
         limit: 10,
       });
