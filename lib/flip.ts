@@ -121,6 +121,9 @@ export class FlipClient {
     }
 
     console.log(`[Flip] ${method} ${url}`);
+    if (body) {
+      console.log(`[Flip] Request body: ${JSON.stringify(body, null, 2)}`);
+    }
 
     const response = await fetch(url, options);
 
@@ -134,11 +137,14 @@ export class FlipClient {
 
     // Handle 200/201 with no content
     const contentType = response.headers.get('content-type');
+    console.log(`[Flip] Response ${response.status}, content-type: ${contentType}`);
+
     if (!contentType || !contentType.includes('application/json')) {
       return {} as T;
     }
 
     const text = await response.text();
+    console.log(`[Flip] Response body: ${text.substring(0, 1000)}`);
     if (!text || text.trim() === '') {
       return {} as T;
     }
@@ -266,8 +272,8 @@ export class FlipClient {
   /**
    * Sync balances to Flip (batch)
    */
-  async syncBalances(balances: FlipSyncBalance[]): Promise<void> {
-    await this.request('POST', '/api/hr/v4/integration/balances/sync', {
+  async syncBalances(balances: FlipSyncBalance[]): Promise<unknown> {
+    return this.request('POST', '/api/hr/v4/integration/balances/sync', {
       items: balances,
     });
   }

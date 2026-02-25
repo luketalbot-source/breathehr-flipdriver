@@ -13,7 +13,7 @@ import type { FlipSyncBalance } from '../../lib/types';
  * 1. Gets their holiday allowance from BreatheHR (via allowances list)
  * 2. Gets their taken absences from BreatheHR
  * 3. Calculates available balance
- * 4. Pushes the balance to Flip
+ * 4. Pushes the balance to Flip using the policy's Flip UUID
  */
 export default async function handler(
   req: VercelRequest,
@@ -35,7 +35,7 @@ export default async function handler(
     const mappings = await userMapping.getAllMappings();
     console.log(`[SyncBalances] Processing ${mappings.length} mapped users`);
 
-    // Get the Flip "Annual Leave" policy to reference
+    // Get the Flip "Annual Leave" policy to get its UUID
     const policiesResult = await flip.getAbsencePolicies('annual_leave');
     const annualLeavePolicy = policiesResult.items?.[0];
 
@@ -43,18 +43,25 @@ export default async function handler(
       throw new Error('Annual Leave policy not found in Flip. Run policy sync first.');
     }
 
+    console.log(
+      `[SyncBalances] Annual Leave policy: id=${annualLeavePolicy.id}, ` +
+      `external_id=${annualLeavePolicy.external_id}, ` +
+      `time_unit=${annualLeavePolicy.time_unit}`
+    );
+
     // Fetch ALL holiday allowances from BreatheHR upfront
     // The employee record only has { name, id } — the amount is in this list
     const allowancesResult = await breathe.listHolidayAllowances();
     const allowanceMap = new Map<number, { amount: number; units: string }>();
     for (const ha of allowancesResult.holiday_allowances || []) {
       allowanceMap.set(ha.id, {
-        amount: parseFloat(ha.amount) || 0,
+        amount: parseFloat(String(ha.amount)) || 0,
         units: ha.units || 'days',
       });
     }
 
     console.log(`[SyncBalances] Loaded ${allowanceMap.size} holiday allowances from BreatheHR`);
+    console.log(`[SyncBalances] Allowances: ${JSON.stringify(Object.fromEntries(allowanceMap))}`);
 
     const balances: FlipSyncBalance[] = [];
     let successCount = 0;
@@ -80,12 +87,19 @@ export default async function handler(
           ? allowanceMap.get(empAllowanceId)
           : undefined;
 
-        const totalDays = allowanceDetails?.amount || 0;
+        const totalAllowance = allowanceDetails?.amount || 0;
         const isHours = allowanceDetails?.units === 'hours';
         const timeUnit = isHours ? 'HOURS' : 'DAYS';
 
+        console.log(
+          `[SyncBalances] Employee ${employee.first_name} ${employee.last_name}: ` +
+          `allowanceId=${empAllowanceId}, totalAllowance=${totalAllowance}, units=${allowanceDetails?.units}`
+        );
+
         // Get absences to calculate taken days
         const absences = await breathe.getAllEmployeeAbsences(mapping.breatheEmployeeId);
+
+        console.log(`[SyncBalances] Found ${absences.length} absences for employee ${mapping.breatheEmployeeId}`);
 
         // Calculate taken days (sum of deducted days from non-cancelled absences)
         // BreatheHR doesn't have a "status" field — absences are either active or cancelled
@@ -95,18 +109,30 @@ export default async function handler(
             return a.cancelled !== true && a.cancelled !== 'true';
           })
           .reduce((sum: number, a: Record<string, unknown>) => {
-            return sum + (parseFloat(String(a.deducted || '0')) || 0);
+            const deducted = parseFloat(String(a.deducted || '0')) || 0;
+            if (deducted > 0) {
+              console.log(
+                `[SyncBalances]   Absence ${a.id}: deducted=${a.deducted} (parsed=${deducted}), ` +
+                `cancelled=${a.cancelled}, start=${a.start_date}, end=${a.end_date}`
+              );
+            }
+            return sum + deducted;
           }, 0);
 
-        const availableDays = Math.max(0, totalDays - takenDays);
+        // Available = total allowance - taken
+        // Note: BreatheHR also has "adjustments" but we can't easily get those via API,
+        // so we report what we can. The formula is: available = total - taken.
+        const availableDays = Math.max(0, totalAllowance - takenDays);
 
+        // Use BOTH policy id (UUID) and external_id for reliable matching
         const balance: FlipSyncBalance = {
           user_id: mapping.flipUserId,
           policy: {
-            external_id: 'annual_leave',
+            id: annualLeavePolicy.id,
+            external_id: annualLeavePolicy.external_id || 'annual_leave',
           },
           balance: {
-            total: totalDays,
+            total: totalAllowance,
             available: availableDays,
             taken: takenDays,
             unlimited: false,
@@ -119,7 +145,7 @@ export default async function handler(
 
         console.log(
           `[SyncBalances] ${employee.first_name} ${employee.last_name}: ` +
-            `total=${totalDays}, taken=${takenDays}, available=${availableDays} ${timeUnit}`
+            `total=${totalAllowance}, taken=${takenDays}, available=${availableDays} ${timeUnit}`
         );
       } catch (error) {
         console.error(
@@ -131,12 +157,18 @@ export default async function handler(
     }
 
     // Push all balances to Flip in batches
+    console.log(`[SyncBalances] Sending ${balances.length} balances to Flip...`);
+    console.log(`[SyncBalances] Payload: ${JSON.stringify({ items: balances }, null, 2)}`);
+
     const batchSize = 100;
+    const syncResults: unknown[] = [];
     for (let i = 0; i < balances.length; i += batchSize) {
       const batch = balances.slice(i, i + batchSize);
-      await flip.syncBalances(batch);
+      const result = await flip.syncBalances(batch);
+      syncResults.push(result);
       console.log(
-        `[SyncBalances] Pushed batch ${Math.floor(i / batchSize) + 1} (${batch.length} balances)`
+        `[SyncBalances] Pushed batch ${Math.floor(i / batchSize) + 1} ` +
+        `(${batch.length} balances), response: ${JSON.stringify(result)}`
       );
     }
 
@@ -149,12 +181,21 @@ export default async function handler(
       synced: successCount,
       errors: errorCount,
       total_users: mappings.length,
+      policy_used: {
+        id: annualLeavePolicy.id,
+        external_id: annualLeavePolicy.external_id,
+        name: annualLeavePolicy.name,
+        time_unit: annualLeavePolicy.time_unit,
+      },
       balances_sent: balances.map(b => ({
         user: b.user_id,
+        policy: b.policy,
         total: b.balance.total,
         taken: b.balance.taken,
         available: b.balance.available,
+        time_unit: b.balance.time_unit,
       })),
+      flip_response: syncResults,
     });
   } catch (error) {
     console.error('[SyncBalances] Error:', error);
