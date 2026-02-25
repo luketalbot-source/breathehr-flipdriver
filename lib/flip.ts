@@ -135,21 +135,28 @@ export class FlipClient {
       );
     }
 
-    // Handle 200/201 with no content
+    // Always read the raw response body for logging
     const contentType = response.headers.get('content-type');
-    console.log(`[Flip] Response ${response.status}, content-type: ${contentType}`);
+    const rawText = await response.text();
+    console.log(
+      `[Flip] Response ${response.status}, content-type: ${contentType}, ` +
+      `body-length: ${rawText.length}, body: ${rawText.substring(0, 500)}`
+    );
 
-    if (!contentType || !contentType.includes('application/json')) {
+    if (!rawText || rawText.trim() === '') {
       return {} as T;
     }
 
-    const text = await response.text();
-    console.log(`[Flip] Response body: ${text.substring(0, 1000)}`);
-    if (!text || text.trim() === '') {
-      return {} as T;
+    if (contentType && contentType.includes('application/json')) {
+      return JSON.parse(rawText) as T;
     }
 
-    return JSON.parse(text) as T;
+    // Try to parse as JSON even if content-type is wrong
+    try {
+      return JSON.parse(rawText) as T;
+    } catch {
+      return {} as T;
+    }
   }
 
   // ============================================================
