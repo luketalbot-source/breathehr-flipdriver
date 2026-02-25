@@ -3,10 +3,6 @@ import { BreatheHRClient } from '../../lib/breathehr';
 import { FlipClient } from '../../lib/flip';
 import { UserMappingService } from '../../lib/user-mapping';
 import { logWebhook, getWebhookLogs } from '../../lib/webhook-log';
-import type {
-  AbsenceCreatedWebhookData,
-  AbsenceCancelledWebhookData,
-} from '../../lib/types';
 
 const breathe = new BreatheHRClient();
 const flip = new FlipClient();
@@ -17,6 +13,20 @@ const userMapping = new UserMappingService(breathe, flip);
  *
  * GET  /api/webhooks/absence-request  → View recent webhook logs
  * POST /api/webhooks/absence-request  → Handle webhook events
+ *
+ * Flip sends batched webhook payloads:
+ * {
+ *   "id": "batch-uuid",
+ *   "items": [
+ *     {
+ *       "type": "hr.absence.requested",
+ *       "data": { "id": "...", "absentee": "user-uuid", ... },
+ *       "timestamp": "..."
+ *     }
+ *   ],
+ *   "recipient": "...",
+ *   "tenant": "..."
+ * }
  */
 export default async function handler(
   req: VercelRequest,
@@ -40,8 +50,6 @@ export default async function handler(
     headers: {
       'content-type': req.headers['content-type'] as string || '',
       'user-agent': req.headers['user-agent'] as string || '',
-      'x-webhook-id': req.headers['x-webhook-id'] as string || '',
-      'x-webhook-signature': req.headers['x-webhook-signature'] as string || '',
     },
     body: req.body,
     result: undefined as string | undefined,
@@ -50,35 +58,40 @@ export default async function handler(
 
   try {
     const payload = req.body;
-    const eventType = payload?.event_type || payload?.type || '';
+    const items = payload?.items || [];
 
-    console.log(`[Webhook] Received event: ${eventType}`);
+    console.log(`[Webhook] Received batch ${payload?.id} with ${items.length} items`);
     console.log(`[Webhook] Payload:`, JSON.stringify(payload, null, 2));
 
-    switch (eventType) {
-      case 'hr.absence-request.created':
-      case 'absence_request.created':
-      case 'absence_request_created':
-        await handleAbsenceCreated(payload.data || payload);
-        break;
+    const results: string[] = [];
 
-      case 'hr.absence-request.cancelled':
-      case 'absence_request.cancelled':
-      case 'absence_request_cancelled':
-        await handleAbsenceCancelled(payload.data || payload);
-        break;
+    for (const item of items) {
+      const eventType = item.type || '';
+      const data = item.data || {};
 
-      default:
-        console.log(`[Webhook] Unknown event type: ${eventType}`);
-        logEntry.result = `ignored: unknown event_type "${eventType}"`;
-        logWebhook(logEntry);
-        res.status(200).json({ status: 'ignored', event_type: eventType });
-        return;
+      console.log(`[Webhook] Processing event: ${eventType}`);
+
+      switch (eventType) {
+        case 'hr.absence.requested':
+          await handleAbsenceCreated(data);
+          results.push(`created: ${data.id}`);
+          break;
+
+        case 'hr.absence.cancelled':
+          await handleAbsenceCancelled(data);
+          results.push(`cancelled: ${data.id}`);
+          break;
+
+        default:
+          console.log(`[Webhook] Unknown event type: ${eventType}`);
+          results.push(`ignored: ${eventType}`);
+          break;
+      }
     }
 
-    logEntry.result = 'ok';
+    logEntry.result = `ok: ${results.join(', ')}`;
     logWebhook(logEntry);
-    res.status(200).json({ status: 'ok' });
+    res.status(200).json({ status: 'ok', processed: results });
   } catch (error) {
     console.error('[Webhook] Error processing webhook:', error);
     logEntry.error = error instanceof Error ? error.message : String(error);
@@ -86,11 +99,10 @@ export default async function handler(
 
     // Try to set error status on the absence request in Flip
     try {
-      const absenceRequestId =
-        req.body?.data?.absence_request_id || req.body?.absence_request_id;
-      if (absenceRequestId) {
+      const firstItem = req.body?.items?.[0]?.data;
+      if (firstItem?.id) {
         await flip.setAbsenceRequestError({
-          absence_request_id: absenceRequestId,
+          absence_request_id: firstItem.id,
         });
       }
     } catch (flipError) {
@@ -107,57 +119,67 @@ export default async function handler(
 /**
  * Handle new absence request created by user in Flip MiniApp
  *
- * Flow:
- * 1. Look up BreatheHR employee from Flip user ID
- * 2. Map the absence policy to a BreatheHR leave reason
- * 3. Create a leave request in BreatheHR
- * 4. Store the BreatheHR leave request ID as external_id in Flip
- * 5. Auto-approve in Flip (BreatheHR will handle its own approval flow)
+ * Actual Flip webhook data format:
+ * {
+ *   "id": "absence-request-uuid",
+ *   "absentee": "user-uuid",
+ *   "policy_id": "policy-uuid",
+ *   "policy_external_id": "annual_leave",
+ *   "starts_from": { "date": "2026-03-10T00:00:00", "type": "FIRST_HALF" },
+ *   "ends_at": { "date": "2026-03-12T00:00:00", "type": "SECOND_HALF" },
+ *   "requestor_comment": "...",
+ *   "status": "PENDING"
+ * }
  */
-async function handleAbsenceCreated(data: AbsenceCreatedWebhookData): Promise<void> {
-  const {
-    absence_request_id,
-    user_id,
-    policy_id,
-    starts_from,
-    ends_at,
-    requestor_comment,
-    policy_external_id,
-  } = data;
+async function handleAbsenceCreated(data: Record<string, unknown>): Promise<void> {
+  const absenceRequestId = data.id as string;
+  const userId = data.absentee as string;
+  const policyId = data.policy_id as string;
+  const policyExternalId = data.policy_external_id as string | null;
+  const requestorComment = data.requestor_comment as string | null;
+  const startsFrom = data.starts_from as { date: string; type: string } | undefined;
+  const endsAt = data.ends_at as { date: string; type: string } | undefined;
 
   console.log(
-    `[Webhook] Processing absence creation: request=${absence_request_id}, user=${user_id}`
+    `[Webhook] Processing absence creation: request=${absenceRequestId}, user=${userId}, policy=${policyId}`
   );
 
+  if (!absenceRequestId || !userId) {
+    throw new Error(`Missing required fields: id=${absenceRequestId}, absentee=${userId}`);
+  }
+
   // 1. Map Flip user to BreatheHR employee
-  const breatheEmployeeId = await userMapping.getBreatheEmployeeId(user_id);
+  const breatheEmployeeId = await userMapping.getBreatheEmployeeId(userId);
   if (!breatheEmployeeId) {
-    console.error(`[Webhook] No BreatheHR mapping found for Flip user ${user_id}`);
+    console.error(`[Webhook] No BreatheHR mapping found for Flip user ${userId}`);
     await flip.setAbsenceRequestError({
-      absence_request_id,
+      absence_request_id: absenceRequestId,
     });
-    throw new Error(`No BreatheHR employee mapping for Flip user ${user_id}`);
+    throw new Error(`No BreatheHR employee mapping for Flip user ${userId}`);
   }
 
   // 2. Determine the BreatheHR leave reason ID from the policy external_id
-  // The external_id on the policy corresponds to the BreatheHR leave reason ID
-  const leaveReasonId = policy_external_id
-    ? parseInt(policy_external_id, 10)
+  const leaveReasonId = policyExternalId
+    ? parseInt(policyExternalId, 10)
     : undefined;
 
-  // 3. Map half-day types
-  const halfStart = starts_from?.type === 'SECOND_HALF';
-  const halfEnd = ends_at?.type === 'FIRST_HALF';
+  // 3. Parse dates — Flip sends "2026-03-10T00:00:00", BreatheHR needs "2026-03-10"
+  const startDate = startsFrom?.date?.split('T')[0] || '';
+  const endDate = endsAt?.date?.split('T')[0] || '';
 
-  // 4. Create leave request in BreatheHR
+  // 4. Map half-day types
+  const halfStart = startsFrom?.type === 'SECOND_HALF';
+  const halfEnd = endsAt?.type === 'FIRST_HALF';
+
+  // 5. Create leave request in BreatheHR
   const result = await breathe.createLeaveRequest(
     breatheEmployeeId,
-    starts_from.date,
-    ends_at.date,
+    startDate,
+    endDate,
     {
       halfStart,
       halfEnd,
-      notes: requestor_comment || undefined,
+      notes: requestorComment || undefined,
       leaveReasonId: leaveReasonId && !isNaN(leaveReasonId) ? leaveReasonId : undefined,
     }
   );
@@ -171,53 +193,50 @@ async function handleAbsenceCreated(data: AbsenceCreatedWebhookData): Promise<vo
     `[Webhook] Created BreatheHR leave request ${leaveRequest.id} for employee ${breatheEmployeeId}`
   );
 
-  // 5. Patch the Flip absence request with BreatheHR's leave request ID
+  // 6. Patch the Flip absence request with BreatheHR's leave request ID
   await flip.patchAbsenceRequestExternalId(
-    absence_request_id,
+    absenceRequestId,
     String(leaveRequest.id)
   );
 
-  // 6. Auto-approve in Flip (BreatheHR handles its own workflow)
-  // The driver acts as the approver for Flip's side
-  await flip.approveAbsenceRequest(user_id, {
-    absence_request_id,
+  // 7. Auto-approve in Flip (BreatheHR handles its own approval flow)
+  await flip.approveAbsenceRequest(userId, {
+    absence_request_id: absenceRequestId,
   });
 
   console.log(
-    `[Webhook] Absence request ${absence_request_id} approved in Flip, linked to BreatheHR ${leaveRequest.id}`
+    `[Webhook] Absence request ${absenceRequestId} approved in Flip, linked to BreatheHR ${leaveRequest.id}`
   );
 }
 
 /**
  * Handle absence request cancelled by user in Flip MiniApp
- *
- * Flow:
- * 1. Look up the BreatheHR absence ID from the external_id
- * 2. Cancel the absence in BreatheHR
  */
-async function handleAbsenceCancelled(data: AbsenceCancelledWebhookData): Promise<void> {
-  const { absence_request_id, user_id, external_id } = data;
+async function handleAbsenceCancelled(data: Record<string, unknown>): Promise<void> {
+  const absenceRequestId = data.id as string;
+  const userId = data.absentee as string;
+  const externalId = data.external_id as string | null;
 
   console.log(
-    `[Webhook] Processing absence cancellation: request=${absence_request_id}, user=${user_id}`
+    `[Webhook] Processing absence cancellation: request=${absenceRequestId}, user=${userId}`
   );
 
-  if (!external_id) {
+  if (!externalId) {
     console.warn(
-      `[Webhook] No external_id on absence request ${absence_request_id}, cannot cancel in BreatheHR`
+      `[Webhook] No external_id on absence request ${absenceRequestId}, cannot cancel in BreatheHR`
     );
     return;
   }
 
-  const breatheAbsenceId = parseInt(external_id, 10);
+  const breatheAbsenceId = parseInt(externalId, 10);
   if (isNaN(breatheAbsenceId)) {
-    throw new Error(`Invalid BreatheHR absence ID: ${external_id}`);
+    throw new Error(`Invalid BreatheHR absence ID: ${externalId}`);
   }
 
   // Cancel in BreatheHR
   await breathe.cancelAbsence(breatheAbsenceId);
 
   console.log(
-    `[Webhook] Cancelled BreatheHR absence ${breatheAbsenceId} (Flip request ${absence_request_id})`
+    `[Webhook] Cancelled BreatheHR absence ${breatheAbsenceId} (Flip request ${absenceRequestId})`
   );
 }
