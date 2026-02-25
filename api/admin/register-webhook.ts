@@ -31,8 +31,26 @@ export default async function handler(
       return;
     }
 
+    // DELETE: Delete a webhook by ID (pass ?id=xxx)
+    if (req.method === 'DELETE') {
+      const webhookId = req.query.id as string;
+      if (!webhookId) {
+        res.status(400).json({ error: 'Missing ?id= parameter' });
+        return;
+      }
+      const delResp = await fetch(`${flipBaseUrl}/api/webhooks/v4/webhooks/${webhookId}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+      res.status(delResp.status).json({
+        status: delResp.ok ? 'deleted' : 'error',
+        webhook_id: webhookId,
+      });
+      return;
+    }
+
     if (req.method !== 'POST') {
-      res.status(405).json({ error: 'Method not allowed. Use GET or POST.' });
+      res.status(405).json({ error: 'Method not allowed. Use GET, POST, or DELETE.' });
       return;
     }
 
