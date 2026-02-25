@@ -37,11 +37,13 @@ export default async function handler(
     console.log(`[Webhook] Payload:`, JSON.stringify(payload, null, 2));
 
     switch (eventType) {
+      case 'hr.absence-request.created':
       case 'absence_request.created':
       case 'absence_request_created':
         await handleAbsenceCreated(payload.data || payload);
         break;
 
+      case 'hr.absence-request.cancelled':
       case 'absence_request.cancelled':
       case 'absence_request_cancelled':
         await handleAbsenceCancelled(payload.data || payload);
