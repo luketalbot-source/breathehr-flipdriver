@@ -41,7 +41,7 @@ export class FlipClient {
    * Get a valid access token, refreshing if needed.
    * Uses OAuth2 client_credentials grant.
    */
-  private async getAccessToken(): Promise<string> {
+  async getAccessToken(): Promise<string> {
     // Return cached token if still valid (with 30s buffer)
     if (this.accessToken && Date.now() < this.tokenExpiresAt - 30000) {
       return this.accessToken;
