@@ -87,12 +87,12 @@ export default async function handler(
         // Get absences to calculate taken days
         const absences = await breathe.getAllEmployeeAbsences(mapping.breatheEmployeeId);
 
-        // Calculate taken days (sum of deducted days from approved Holiday absences)
-        // Note: BreatheHR returns deducted as a string like "2.0"
+        // Calculate taken days (sum of deducted days from non-cancelled absences)
+        // BreatheHR doesn't have a "status" field — absences are either active or cancelled
+        // deducted is returned as a string like "2.0"
         const takenDays = absences
           .filter((a: Record<string, unknown>) => {
-            const status = String(a.status || '').toLowerCase();
-            return status === 'approved';
+            return a.cancelled !== true && a.cancelled !== 'true';
           })
           .reduce((sum: number, a: Record<string, unknown>) => {
             return sum + (parseFloat(String(a.deducted || '0')) || 0);
