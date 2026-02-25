@@ -150,8 +150,8 @@ export class BreatheHRClient {
       leave_request: {
         start_date: startDate,
         end_date: endDate,
-        ...(options?.halfStart !== undefined && { start_half_day: options.halfStart }),
-        ...(options?.halfEnd !== undefined && { end_half_day: options.halfEnd }),
+        half_start: options?.halfStart ?? false,
+        half_end: options?.halfEnd ?? false,
         ...(options?.notes && { notes: options.notes }),
         ...(options?.leaveReasonId && { leave_reason_id: options.leaveReasonId }),
       },
