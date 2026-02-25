@@ -2,6 +2,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { BreatheHRClient } from '../../lib/breathehr';
 import { FlipClient } from '../../lib/flip';
 import { UserMappingService } from '../../lib/user-mapping';
+import { logWebhook, getWebhookLogs } from '../../lib/webhook-log';
 import type {
   AbsenceCreatedWebhookData,
   AbsenceCancelledWebhookData,
@@ -14,20 +15,38 @@ const userMapping = new UserMappingService(breathe, flip);
 /**
  * Webhook handler for absence request events from Flip
  *
- * POST /api/webhooks/absence-request
- *
- * Flip calls this when:
- * - A user creates an absence request (event_type: "absence_request.created")
- * - A user cancels an absence request (event_type: "absence_request.cancelled")
+ * GET  /api/webhooks/absence-request  → View recent webhook logs
+ * POST /api/webhooks/absence-request  → Handle webhook events
  */
 export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ): Promise<void> {
+  // GET: Return recent webhook logs for debugging
+  if (req.method === 'GET') {
+    res.status(200).json({ logs: getWebhookLogs() });
+    return;
+  }
+
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
     return;
   }
+
+  // Log the raw incoming webhook
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    method: req.method,
+    headers: {
+      'content-type': req.headers['content-type'] as string || '',
+      'user-agent': req.headers['user-agent'] as string || '',
+      'x-webhook-id': req.headers['x-webhook-id'] as string || '',
+      'x-webhook-signature': req.headers['x-webhook-signature'] as string || '',
+    },
+    body: req.body,
+    result: undefined as string | undefined,
+    error: undefined as string | undefined,
+  };
 
   try {
     const payload = req.body;
@@ -51,13 +70,19 @@ export default async function handler(
 
       default:
         console.log(`[Webhook] Unknown event type: ${eventType}`);
+        logEntry.result = `ignored: unknown event_type "${eventType}"`;
+        logWebhook(logEntry);
         res.status(200).json({ status: 'ignored', event_type: eventType });
         return;
     }
 
+    logEntry.result = 'ok';
+    logWebhook(logEntry);
     res.status(200).json({ status: 'ok' });
   } catch (error) {
     console.error('[Webhook] Error processing webhook:', error);
+    logEntry.error = error instanceof Error ? error.message : String(error);
+    logWebhook(logEntry);
 
     // Try to set error status on the absence request in Flip
     try {
