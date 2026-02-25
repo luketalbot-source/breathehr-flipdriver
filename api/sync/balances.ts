@@ -125,6 +125,7 @@ export default async function handler(
         const availableDays = Math.max(0, totalAllowance - takenDays);
 
         // Use BOTH policy id (UUID) and external_id for reliable matching
+        // Also include external_id on the balance itself for linking
         const balance: FlipSyncBalance = {
           user_id: mapping.flipUserId,
           policy: {
@@ -132,6 +133,7 @@ export default async function handler(
             external_id: annualLeavePolicy.external_id || 'annual_leave',
           },
           balance: {
+            external_id: `breathehr_${mapping.breatheEmployeeId}_annual_leave`,
             total: totalAllowance,
             available: availableDays,
             taken: takenDays,
