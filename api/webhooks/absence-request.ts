@@ -78,6 +78,7 @@ export default async function handler(
           break;
 
         case 'hr.absence.cancelled':
+        case 'hr.absence.canceled':
           await handleAbsenceCancelled(data);
           results.push(`cancelled: ${data.id}`);
           break;
