@@ -237,10 +237,39 @@ export class BreatheHRClient {
   }
 
   /**
-   * Cancel an absence
+   * Cancel an absence by absence ID
    */
   async cancelAbsence(absenceId: number): Promise<void> {
     await this.request('POST', `/absences/${absenceId}/cancel`);
+  }
+
+  /**
+   * Cancel/delete a leave request
+   * Tries DELETE first (for pending requests), falls back to cancel endpoint
+   */
+  async cancelLeaveRequest(leaveRequestId: number): Promise<void> {
+    try {
+      // Try DELETE first — works for pending leave requests
+      await this.request('DELETE', `/leave_requests/${leaveRequestId}`);
+      console.log(`[BreatheHR] Deleted leave request ${leaveRequestId}`);
+    } catch (deleteError) {
+      console.log(
+        `[BreatheHR] DELETE leave_request ${leaveRequestId} failed: ` +
+          `${deleteError instanceof Error ? deleteError.message : deleteError}. ` +
+          `Trying cancel endpoint...`
+      );
+      // Fall back to cancel endpoint
+      try {
+        await this.request('POST', `/leave_requests/${leaveRequestId}/cancel`);
+        console.log(`[BreatheHR] Cancelled leave request ${leaveRequestId}`);
+      } catch (cancelError) {
+        console.log(
+          `[BreatheHR] Cancel leave_request ${leaveRequestId} also failed: ` +
+            `${cancelError instanceof Error ? cancelError.message : cancelError}`
+        );
+        throw cancelError;
+      }
+    }
   }
 
   /**

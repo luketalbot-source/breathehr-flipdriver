@@ -211,14 +211,26 @@ async function handleAbsenceCreated(data: Record<string, unknown>): Promise<void
 
 /**
  * Handle absence request cancelled by user in Flip MiniApp
+ *
+ * The external_id on the Flip request is the BreatheHR LEAVE REQUEST ID
+ * (not the absence ID — they're different in BreatheHR).
+ *
+ * Two cases:
+ * 1. Leave request is still PENDING → cancel/delete the leave request
+ * 2. Leave request was APPROVED (absence exists) → find the absence and cancel it
  */
 async function handleAbsenceCancelled(data: Record<string, unknown>): Promise<void> {
   const absenceRequestId = data.id as string;
   const userId = data.absentee as string;
   const externalId = data.external_id as string | null;
 
+  // Also extract dates from the webhook data (used to find the absence if needed)
+  const startsFrom = data.starts_from as { date: string } | undefined;
+  const endsAt = data.ends_at as { date: string } | undefined;
+
   console.log(
-    `[Webhook] Processing absence cancellation: request=${absenceRequestId}, user=${userId}`
+    `[Webhook] Processing absence cancellation: request=${absenceRequestId}, ` +
+      `user=${userId}, external_id=${externalId}`
   );
 
   if (!externalId) {
@@ -228,15 +240,91 @@ async function handleAbsenceCancelled(data: Record<string, unknown>): Promise<vo
     return;
   }
 
-  const breatheAbsenceId = parseInt(externalId, 10);
-  if (isNaN(breatheAbsenceId)) {
-    throw new Error(`Invalid BreatheHR absence ID: ${externalId}`);
+  const breatheLeaveRequestId = parseInt(externalId, 10);
+  if (isNaN(breatheLeaveRequestId)) {
+    throw new Error(`Invalid BreatheHR leave request ID: ${externalId}`);
   }
 
-  // Cancel in BreatheHR
-  await breathe.cancelAbsence(breatheAbsenceId);
+  // Step 1: Try to cancel/delete the leave request directly
+  // This works when the request is still pending in BreatheHR
+  try {
+    await breathe.cancelLeaveRequest(breatheLeaveRequestId);
+    console.log(
+      `[Webhook] Cancelled BreatheHR leave request ${breatheLeaveRequestId} (Flip ${absenceRequestId})`
+    );
+    return;
+  } catch (leaveRequestError) {
+    console.log(
+      `[Webhook] Could not cancel leave request ${breatheLeaveRequestId}: ` +
+        `${leaveRequestError instanceof Error ? leaveRequestError.message : leaveRequestError}. ` +
+        `The request may have already been approved — trying to find and cancel the absence.`
+    );
+  }
 
-  console.log(
-    `[Webhook] Cancelled BreatheHR absence ${breatheAbsenceId} (Flip request ${absenceRequestId})`
+  // Step 2: Leave request cancel failed — it was probably already approved
+  // and became an absence. Find the matching absence by dates + employee.
+  const breatheEmployeeId = await userMapping.getBreatheEmployeeId(userId);
+  if (!breatheEmployeeId) {
+    throw new Error(
+      `Cannot cancel: no BreatheHR mapping for Flip user ${userId} ` +
+        `and leave request cancel failed`
+    );
+  }
+
+  // Try to find the absence that matches this leave request's dates
+  const startDate = startsFrom?.date?.split('T')[0] || '';
+  const endDate = endsAt?.date?.split('T')[0] || '';
+
+  const absences = await breathe.getAllEmployeeAbsences(breatheEmployeeId);
+
+  // Match by dates first, then fall back to checking the leave request for dates
+  let matchingAbsence = absences.find(
+    (a) =>
+      a.start_date === startDate &&
+      a.end_date === endDate &&
+      !((a as Record<string, unknown>).cancelled === true ||
+        (a as Record<string, unknown>).cancelled === 'true')
   );
+
+  // If no date match from webhook data, try fetching the leave request for dates
+  if (!matchingAbsence && breatheLeaveRequestId) {
+    try {
+      const lrResult = await breathe.getLeaveRequest(breatheLeaveRequestId);
+      const lr = lrResult.leave_requests?.[0];
+      if (lr) {
+        matchingAbsence = absences.find(
+          (a) =>
+            a.start_date === lr.start_date &&
+            a.end_date === lr.end_date &&
+            !((a as Record<string, unknown>).cancelled === true ||
+              (a as Record<string, unknown>).cancelled === 'true')
+        );
+      }
+    } catch {
+      console.log(
+        `[Webhook] Could not fetch leave request ${breatheLeaveRequestId} for date matching`
+      );
+    }
+  }
+
+  if (matchingAbsence) {
+    await breathe.cancelAbsence(matchingAbsence.id);
+    console.log(
+      `[Webhook] Cancelled BreatheHR absence ${matchingAbsence.id} ` +
+        `(dates: ${matchingAbsence.start_date} - ${matchingAbsence.end_date}, ` +
+        `Flip request ${absenceRequestId})`
+    );
+  } else {
+    console.error(
+      `[Webhook] Could not find matching BreatheHR absence for ` +
+        `leave request ${breatheLeaveRequestId} ` +
+        `(dates: ${startDate || 'unknown'} - ${endDate || 'unknown'}, ` +
+        `employee ${breatheEmployeeId}). ` +
+        `Manual intervention may be needed.`
+    );
+    throw new Error(
+      `Could not cancel: leave request ${breatheLeaveRequestId} cancel failed ` +
+        `and no matching absence found`
+    );
+  }
 }
