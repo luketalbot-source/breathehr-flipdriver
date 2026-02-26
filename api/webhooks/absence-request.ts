@@ -199,13 +199,13 @@ async function handleAbsenceCreated(data: Record<string, unknown>): Promise<void
     String(leaveRequest.id)
   );
 
-  // 7. Auto-approve in Flip (BreatheHR handles its own approval flow)
-  await flip.approveAbsenceRequest(userId, {
-    absence_request_id: absenceRequestId,
-  });
+  // Note: Do NOT auto-approve in Flip here.
+  // The request stays PENDING until BreatheHR's manager approves it.
+  // Our periodic absence sync (every 30 mins) will detect the approval
+  // in BreatheHR and update the status to APPROVED in Flip.
 
   console.log(
-    `[Webhook] Absence request ${absenceRequestId} approved in Flip, linked to BreatheHR ${leaveRequest.id}`
+    `[Webhook] Absence request ${absenceRequestId} created in BreatheHR as ${leaveRequest.id} — awaiting approval`
   );
 }
 

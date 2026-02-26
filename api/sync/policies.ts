@@ -15,6 +15,9 @@ import type { FlipAbsencePolicySync } from '../../lib/types';
  *
  * Each policy uses the BreatheHR ID as external_id for linking.
  * After syncing policies, assigns them to all mapped Flip users.
+ *
+ * Also detects stale policies in Flip (removed from BreatheHR) —
+ * Flip's API has no delete endpoint so they must be removed manually.
  */
 export default async function handler(
   req: VercelRequest,
@@ -53,15 +56,20 @@ export default async function handler(
 
     console.log(`[SyncPolicies] Found ${leaveReasons.length} other leave reasons in BreatheHR`);
 
+    // Track valid external_ids so we can detect stale policies
+    const validExternalIds = new Set<string>(['annual_leave']);
     const policyIds: string[] = [annualLeaveResult.id];
 
     for (const reason of leaveReasons) {
+      const externalId = String(reason.id);
+      validExternalIds.add(externalId);
+
       const policy: FlipAbsencePolicySync = {
         name: reason.name,
         half_days_allowed: true,
         time_unit: 'DAYS',
         time_units: ['DAYS'],
-        external_id: String(reason.id),
+        external_id: externalId,
       };
 
       const result = await flip.syncAbsencePolicy(policy);
@@ -70,7 +78,7 @@ export default async function handler(
       console.log(`[SyncPolicies] Synced policy "${reason.name}": ${result.id}`);
     }
 
-    // 3. Assign all policies to all mapped users
+    // 3. Assign only active BreatheHR policies to all mapped users
     const mappings = await userMapping.getAllMappings();
     const flipUserIds = mappings.map((m) => m.flipUserId);
 
@@ -83,12 +91,46 @@ export default async function handler(
       }
     }
 
+    // 4. Detect stale policies in Flip that no longer exist in BreatheHR
+    const allFlipPolicies = await flip.getAbsencePolicies();
+    const stalePolicies: Array<{ id: string; name: string; external_id: string }> = [];
+
+    for (const fp of allFlipPolicies.items || []) {
+      // Only flag policies whose external_id looks like a BreatheHR numeric ID
+      // (skip ones from other integrations that use different naming)
+      if (
+        fp.external_id &&
+        !validExternalIds.has(fp.external_id) &&
+        /^\d+$/.test(fp.external_id)
+      ) {
+        stalePolicies.push({
+          id: fp.id,
+          name: fp.name,
+          external_id: fp.external_id,
+        });
+      }
+    }
+
+    if (stalePolicies.length > 0) {
+      console.warn(
+        `[SyncPolicies] Found ${stalePolicies.length} stale policies in Flip ` +
+        `(removed from BreatheHR, no delete API available):`
+      );
+      for (const sp of stalePolicies) {
+        console.warn(`[SyncPolicies]   - "${sp.name}" (external_id=${sp.external_id})`);
+      }
+    }
+
     console.log(`[SyncPolicies] Policy sync complete. Synced ${syncedPolicies.length} policies.`);
 
     res.status(200).json({
       status: 'ok',
       synced_policies: syncedPolicies,
       assigned_users: flipUserIds.length,
+      stale_policies: stalePolicies.length > 0 ? stalePolicies : undefined,
+      stale_note: stalePolicies.length > 0
+        ? 'These policies were removed from BreatheHR but cannot be deleted via Flip API. Remove them manually in Flip admin.'
+        : undefined,
     });
   } catch (error) {
     console.error('[SyncPolicies] Error:', error);
