@@ -65,6 +65,8 @@ export default async function handler(
           mapping.breatheEmployeeId
         );
 
+        console.log(`[SyncAbsences] Found ${absences.length} absences for employee ${mapping.breatheEmployeeId}`);
+
         for (const absence of absences) {
           const syncItem = mapBreatheAbsenceToFlipSync(
             absence,
@@ -74,6 +76,10 @@ export default async function handler(
           if (syncItem) {
             syncItems.push(syncItem);
             successCount++;
+            console.log(
+              `[SyncAbsences] Mapped absence ${absence.id}: ${absence.start_date} - ${absence.end_date}, ` +
+              `status=${syncItem.status}, policy=${syncItem.policy.external_id}`
+            );
           }
         }
       } catch (error) {
@@ -137,13 +143,11 @@ function mapBreatheAbsenceToFlipSync(
   policyByExternalId: Map<string, string>
 ): FlipSyncAbsenceRequest | null {
   // Map the status
-  const status = mapAbsenceStatus(absence.status);
-  if (!status) {
-    console.log(
-      `[SyncAbsences] Skipping absence ${absence.id} with unmappable status: ${absence.status}`
-    );
-    return null;
-  }
+  // BreatheHR doesn't have a "status" field — absences use a "cancelled" boolean
+  const isCancelled =
+    (absence as Record<string, unknown>).cancelled === true ||
+    (absence as Record<string, unknown>).cancelled === 'true';
+  const status: AbsenceRequestStatus = isCancelled ? 'CANCELLED' : 'APPROVED';
 
   // Determine the policy
   // If the absence has a leave_reason, try to find the matching Flip policy
@@ -170,7 +174,7 @@ function mapBreatheAbsenceToFlipSync(
     approver: null,
     absentee: flipUserId,
     duration: absence.deducted
-      ? { amount: absence.deducted, unit: 'DAYS' }
+      ? { amount: parseFloat(String(absence.deducted)) || 0, unit: 'DAYS' }
       : undefined,
     policy: {
       external_id: policyExternalId,
@@ -189,31 +193,5 @@ function mapBreatheAbsenceToFlipSync(
   };
 }
 
-/**
- * Map BreatheHR absence status to Flip status
- */
-function mapAbsenceStatus(
-  breatheStatus?: string
-): AbsenceRequestStatus | null {
-  if (!breatheStatus) return null;
-
-  const normalised = breatheStatus.toLowerCase().trim();
-
-  switch (normalised) {
-    case 'approved':
-    case 'taken':
-      return 'APPROVED';
-    case 'pending':
-    case 'requested':
-      return 'PENDING';
-    case 'rejected':
-    case 'declined':
-      return 'REJECTED';
-    case 'cancelled':
-    case 'canceled':
-      return 'CANCELLED';
-    default:
-      console.log(`[SyncAbsences] Unknown BreatheHR status: ${breatheStatus}`);
-      return null;
-  }
-}
+// Note: BreatheHR absences don't have a "status" field.
+// They use a "cancelled" boolean. Status mapping is done inline in mapBreatheAbsenceToFlipSync.
