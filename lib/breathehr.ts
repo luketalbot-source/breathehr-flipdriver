@@ -243,6 +243,39 @@ export class BreatheHRClient {
     await this.request('POST', `/absences/${absenceId}/cancel`);
   }
 
+  /**
+   * Get leave requests for a specific employee
+   */
+  async getEmployeeLeaveRequests(
+    employeeId: number,
+    page = 1,
+    perPage = 100
+  ): Promise<{ leave_requests: BreatheLeaveRequest[] }> {
+    return this.request('GET', `/employees/${employeeId}/leave_requests`, undefined, {
+      page: page.toString(),
+      per_page: perPage.toString(),
+    });
+  }
+
+  /**
+   * Get all leave requests for an employee (auto-paginate)
+   */
+  async getAllEmployeeLeaveRequests(employeeId: number): Promise<BreatheLeaveRequest[]> {
+    const allRequests: BreatheLeaveRequest[] = [];
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore) {
+      const result = await this.getEmployeeLeaveRequests(employeeId, page, 100);
+      const requests = result.leave_requests || [];
+      allRequests.push(...requests);
+      hasMore = requests.length === 100;
+      page++;
+    }
+
+    return allRequests;
+  }
+
   // ============================================================
   // Holiday Allowances
   // ============================================================
