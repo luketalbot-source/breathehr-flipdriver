@@ -6,6 +6,7 @@ import type {
   FlipSyncAbsenceRequest,
   AbsenceRequestStatus,
   BreatheAbsence,
+  BreatheLeaveRequest,
 } from '../../lib/types';
 
 /**
@@ -18,7 +19,11 @@ import type {
  * 2. Push absence request items
  * 3. Complete sync
  *
- * This ensures Flip has a consistent view of all absences from BreatheHR.
+ * IMPORTANT: For absences created via our webhook (Flip → BreatheHR),
+ * the Flip absence request's external_id is the BreatheHR leave_request.id
+ * (NOT the absence.id). When syncing, we use the leave_request.id as
+ * external_id for these absences so the sync preserves the webhook-created
+ * entries and doesn't create duplicates.
  */
 export default async function handler(
   req: VercelRequest,
@@ -65,20 +70,36 @@ export default async function handler(
           mapping.breatheEmployeeId
         );
 
-        console.log(`[SyncAbsences] Found ${absences.length} absences for employee ${mapping.breatheEmployeeId}`);
+        // Also fetch leave requests to build a date→leave_request_id map.
+        // This ensures the sync uses the same external_id as the webhook-
+        // created Flip entries (which use leave_request.id, not absence.id).
+        const leaveRequestMap = await buildLeaveRequestMap(
+          breathe,
+          mapping.breatheEmployeeId
+        );
+
+        console.log(
+          `[SyncAbsences] Found ${absences.length} absences, ` +
+            `${leaveRequestMap.size} leave request mappings ` +
+            `for employee ${mapping.breatheEmployeeId}`
+        );
 
         for (const absence of absences) {
           const syncItem = mapBreatheAbsenceToFlipSync(
             absence,
             mapping.flipUserId,
-            policyByExternalId
+            policyByExternalId,
+            leaveRequestMap
           );
           if (syncItem) {
             syncItems.push(syncItem);
             successCount++;
             console.log(
-              `[SyncAbsences] Mapped absence ${absence.id}: ${absence.start_date} - ${absence.end_date}, ` +
-              `status=${syncItem.status}, policy=${syncItem.policy.external_id}`
+              `[SyncAbsences] Mapped absence ${absence.id}: ` +
+                `${absence.start_date} - ${absence.end_date}, ` +
+                `status=${syncItem.status}, ` +
+                `external_id=${syncItem.external_id}, ` +
+                `policy=${syncItem.policy.external_id}`
             );
           }
         }
@@ -135,12 +156,50 @@ export default async function handler(
 }
 
 /**
+ * Build a map from (start_date|end_date) → leave_request.id
+ *
+ * This is used to determine the correct external_id for the sync.
+ * When a leave request was created via our webhook, the Flip absence
+ * request's external_id is the leave_request.id. We need to use the
+ * same ID in the sync so Flip matches them correctly.
+ */
+async function buildLeaveRequestMap(
+  breathe: BreatheHRClient,
+  employeeId: number
+): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+
+  try {
+    const leaveRequests = await breathe.getAllEmployeeLeaveRequests(employeeId);
+
+    for (const lr of leaveRequests) {
+      if (lr.start_date && lr.end_date && lr.id) {
+        // Use dates as the key to match against absences
+        const key = `${lr.start_date}|${lr.end_date}`;
+        map.set(key, lr.id);
+      }
+    }
+  } catch (error) {
+    console.log(
+      `[SyncAbsences] Could not fetch leave requests for employee ${employeeId}: ` +
+        `${error instanceof Error ? error.message : error}`
+    );
+  }
+
+  return map;
+}
+
+/**
  * Map a BreatheHR absence to Flip's sync format
+ *
+ * Uses leave_request.id as external_id when a matching leave request
+ * exists (for webhook-created entries), otherwise falls back to absence.id.
  */
 function mapBreatheAbsenceToFlipSync(
   absence: BreatheAbsence,
   flipUserId: string,
-  policyByExternalId: Map<string, string>
+  policyByExternalId: Map<string, string>,
+  leaveRequestMap: Map<string, number>
 ): FlipSyncAbsenceRequest | null {
   // Map the status
   // BreatheHR doesn't have a "status" field — absences use a "cancelled" boolean
@@ -149,13 +208,27 @@ function mapBreatheAbsenceToFlipSync(
     (absence as Record<string, unknown>).cancelled === 'true';
   const status: AbsenceRequestStatus = isCancelled ? 'CANCELLED' : 'APPROVED';
 
+  // Determine the external_id
+  // If there's a matching leave request, use its ID (matches webhook-created entries)
+  // Otherwise use the absence ID
+  const dateKey = `${absence.start_date}|${absence.end_date}`;
+  const leaveRequestId = leaveRequestMap.get(dateKey);
+  const externalId = leaveRequestId
+    ? String(leaveRequestId)
+    : String(absence.id);
+
+  if (leaveRequestId) {
+    console.log(
+      `[SyncAbsences] Using leave_request.id ${leaveRequestId} as external_id ` +
+        `(instead of absence.id ${absence.id}) for ${absence.start_date} - ${absence.end_date}`
+    );
+  }
+
   // Determine the policy
   // If the absence has a leave_reason, try to find the matching Flip policy
   // Otherwise default to "annual_leave"
   let policyExternalId = 'annual_leave';
   if (absence.leave_reason) {
-    // The leave_reason name or ID might match a synced policy
-    // We use the BreatheHR leave reason ID as the external_id
     const leaveReasonId =
       (absence as Record<string, unknown>).leave_reason_id ||
       (absence as Record<string, unknown>).other_leave_reason_id;
@@ -170,7 +243,7 @@ function mapBreatheAbsenceToFlipSync(
 
   return {
     id: null, // New item, let Flip assign ID
-    external_id: String(absence.id),
+    external_id: externalId,
     approver: null,
     absentee: flipUserId,
     duration: absence.deducted
@@ -183,15 +256,16 @@ function mapBreatheAbsenceToFlipSync(
     status,
     last_updated: absence.updated_at || null,
     starts_from: {
-      date: absence.start_date ? `${absence.start_date}T00:00:00` : absence.start_date,
+      date: absence.start_date
+        ? `${absence.start_date}T00:00:00`
+        : absence.start_date,
       type: startsFromType,
     },
     ends_at: {
-      date: absence.end_date ? `${absence.end_date}T00:00:00` : absence.end_date,
+      date: absence.end_date
+        ? `${absence.end_date}T00:00:00`
+        : absence.end_date,
       type: endsAtType,
     },
   };
 }
-
-// Note: BreatheHR absences don't have a "status" field.
-// They use a "cancelled" boolean. Status mapping is done inline in mapBreatheAbsenceToFlipSync.
