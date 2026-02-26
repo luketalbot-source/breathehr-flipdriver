@@ -183,11 +183,11 @@ function mapBreatheAbsenceToFlipSync(
     status,
     last_updated: absence.updated_at || null,
     starts_from: {
-      date: absence.start_date,
+      date: absence.start_date ? `${absence.start_date}T00:00:00` : absence.start_date,
       type: startsFromType,
     },
     ends_at: {
-      date: absence.end_date,
+      date: absence.end_date ? `${absence.end_date}T00:00:00` : absence.end_date,
       type: endsAtType,
     },
   };
