@@ -2,7 +2,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { BreatheHRClient } from '../../lib/breathehr';
 import { FlipClient } from '../../lib/flip';
 import { UserMappingService } from '../../lib/user-mapping';
-import type { BreatheAbsence } from '../../lib/types';
+import type { BreatheLeaveRequest } from '../../lib/types';
 
 /**
  * Check approval status of pending absence requests and trigger Flip notifications
@@ -11,6 +11,18 @@ import type { BreatheAbsence } from '../../lib/types';
  *
  * Problem: Flip's bulk sync endpoint does NOT trigger user notifications.
  * Only the individual approve/reject endpoints send notifications.
+ *
+ * APPROVAL DETECTION STRATEGY:
+ * We do NOT rely on BreatheHR leave_request.status being "approved" because
+ * BreatheHR may remove approved leave requests from the leave_requests endpoint
+ * (they become absences instead). Instead, we detect approval by:
+ *   - A BreatheHR ABSENCE exists (proof of approval)
+ *   - The corresponding Flip absence request is still PENDING
+ *   - We match absence→leave_request by date range to find the external_id
+ *
+ * REJECTION DETECTION:
+ * Rejected leave requests remain in the leave_requests endpoint with status
+ * "denied". We check for that and call Flip's reject endpoint.
  *
  * Flow:
  * 1. User books vacation in Flip → webhook → creates BreatheHR leave request
@@ -21,12 +33,6 @@ import type { BreatheAbsence } from '../../lib/types';
  *
  * 3. This endpoint detects the status change and calls Flip's
  *    approve/reject endpoints → triggers push notification to user
- *
- * IMPORTANT: BreatheHR leave_request IDs ≠ absence IDs.
- * The webhook stores the leave_request.id as external_id in Flip.
- * When approved, a separate absence record is created with a different ID.
- * After approving in Flip, we update the external_id to the absence ID
- * so the bulk absence sync doesn't create duplicates.
  *
  * This runs BEFORE the bulk absence sync in the cron job.
  */
@@ -54,160 +60,55 @@ export default async function handler(
     let stillPending = 0;
     let errorCount = 0;
     const details: string[] = [];
+    // Track external_ids we've already processed to avoid double-processing
+    const processedExternalIds = new Set<string>();
 
     for (const mapping of mappings) {
       try {
-        // Pre-fetch absences for this employee (used for both approval
-        // detection and external_id reconciliation after approval)
+        // Fetch both absences and leave requests for this employee
         const absences = await breathe.getAllEmployeeAbsences(
           mapping.breatheEmployeeId
         );
-
-        console.log(
-          `[ApprovalStatus] Employee ${mapping.breatheEmployeeId}: ` +
-            `${absences.length} absences`
-        );
-
-        // ---------------------------------------------------------------
-        // STEP 1: Check BreatheHR LEAVE REQUESTS for status changes
-        // ---------------------------------------------------------------
-        // The webhook stores leave_request.id as external_id in Flip.
-        // When the leave request is approved/rejected in BreatheHR,
-        // we call Flip's approve/reject endpoints to trigger notifications.
-        //
-        // After approving, we also update the external_id to the
-        // corresponding BreatheHR absence ID (which is different from
-        // the leave request ID) to prevent the bulk sync from creating
-        // duplicate entries.
-        // ---------------------------------------------------------------
-
+        let leaveRequests: BreatheLeaveRequest[] = [];
         try {
-          const leaveRequests = await breathe.getAllEmployeeLeaveRequests(
+          leaveRequests = await breathe.getAllEmployeeLeaveRequests(
             mapping.breatheEmployeeId
           );
-
-          console.log(
-            `[ApprovalStatus] Employee ${mapping.breatheEmployeeId}: ` +
-              `${leaveRequests.length} leave requests`
-          );
-
-          for (const lr of leaveRequests) {
-            const rawStatus = (lr.status || '') as string;
-            const rawAction = (lr.action || '') as string;
-            const status = rawStatus.toLowerCase();
-            const action = rawAction.toLowerCase();
-
-            console.log(
-              `[ApprovalStatus] Leave request ${lr.id}: status="${rawStatus}", action="${rawAction}"`
-            );
-
-            // Check if rejected
-            // BreatheHR uses "denied" (not "rejected" or "declined")
-            const isRejected =
-              status === 'rejected' ||
-              status === 'declined' ||
-              status === 'denied' ||
-              action === 'reject' ||
-              action === 'decline' ||
-              action === 'declined' ||
-              action === 'denied' ||
-              action === 'deny';
-
-            // Check if approved
-            const isApproved =
-              status === 'approved' ||
-              action === 'approve' ||
-              action === 'approved';
-
-            if (!isRejected && !isApproved) {
-              if (status === 'pending' || status === '' || !status) {
-                stillPending++;
-              }
-              continue;
-            }
-
-            // Try to find matching PENDING Flip absence request
-            try {
-              const flipRequest = await flip.getAbsenceRequestByExternalId(
-                String(lr.id)
-              );
-
-              if (!flipRequest || flipRequest.status !== 'PENDING') {
-                // Already processed or not a webhook-created request
-                continue;
-              }
-
-              if (isApproved) {
-                console.log(
-                  `[ApprovalStatus] Leave request ${lr.id} approved in BreatheHR → ` +
-                    `approving Flip request ${flipRequest.id}`
-                );
-
-                await flip.approveAbsenceRequest(mapping.flipUserId, {
-                  external_id: String(lr.id),
-                });
-
-                approvedCount++;
-                details.push(
-                  `approved: LR ${lr.id} → Flip ${flipRequest.id} (${lr.start_date} - ${lr.end_date})`
-                );
-                console.log(
-                  `[ApprovalStatus] ✓ Approved in Flip — notification sent`
-                );
-
-                // -------------------------------------------------------
-                // RECONCILE: Update external_id to match the BreatheHR
-                // absence ID so the bulk absence sync doesn't create
-                // a duplicate entry.
-                //
-                // BreatheHR leave_request.id ≠ absence.id
-                // The webhook stored leave_request.id, but the absence
-                // sync uses absence.id. We update to the absence ID.
-                // -------------------------------------------------------
-                await reconcileExternalId(
-                  flip,
-                  flipRequest.id,
-                  lr,
-                  absences,
-                  mapping.breatheEmployeeId
-                );
-              } else if (isRejected) {
-                console.log(
-                  `[ApprovalStatus] Leave request ${lr.id} rejected in BreatheHR → ` +
-                    `rejecting Flip request ${flipRequest.id}`
-                );
-
-                await flip.rejectAbsenceRequest(mapping.flipUserId, {
-                  external_id: String(lr.id),
-                });
-
-                rejectedCount++;
-                details.push(
-                  `rejected: LR ${lr.id} → Flip ${flipRequest.id}`
-                );
-                console.log(
-                  `[ApprovalStatus] ✗ Rejected in Flip — notification sent`
-                );
-              }
-            } catch {
-              // No matching Flip request — this leave request wasn't
-              // created via our webhook (most common case)
-            }
-          }
-        } catch (leaveError) {
+        } catch (lrError) {
           console.log(
             `[ApprovalStatus] Could not fetch leave requests for employee ` +
               `${mapping.breatheEmployeeId}: ` +
-              `${leaveError instanceof Error ? leaveError.message : leaveError}`
+              `${lrError instanceof Error ? lrError.message : lrError}`
           );
         }
 
+        console.log(
+          `[ApprovalStatus] Employee ${mapping.breatheEmployeeId}: ` +
+            `${absences.length} absences, ${leaveRequests.length} leave requests`
+        );
+
+        // Build date→leave_request map for matching absences to leave requests
+        // The webhook stores leave_request.id as external_id in Flip
+        const leaveRequestsByDate = new Map<string, BreatheLeaveRequest[]>();
+        for (const lr of leaveRequests) {
+          if (lr.start_date && lr.end_date && lr.id) {
+            const key = `${lr.start_date}|${lr.end_date}`;
+            const existing = leaveRequestsByDate.get(key) || [];
+            existing.push(lr);
+            leaveRequestsByDate.set(key, existing);
+          }
+        }
+
         // ---------------------------------------------------------------
-        // STEP 2: Safety net — check absences by absence ID
+        // STEP 1: APPROVAL DETECTION (from absences)
         // ---------------------------------------------------------------
-        // In case the external_id was set to the absence ID (not leave
-        // request ID), also check absences directly. This handles edge
-        // cases and manually created entries.
+        // When a leave request is approved in BreatheHR, an absence record
+        // is created. We detect approval by finding absences that have a
+        // corresponding PENDING Flip request.
+        //
+        // We try two external_id lookups per absence:
+        // a) leave_request.id (set by webhook — most common)
+        // b) absence.id (fallback for non-webhook or legacy entries)
         // ---------------------------------------------------------------
 
         for (const absence of absences) {
@@ -216,30 +117,259 @@ export default async function handler(
             (absence as Record<string, unknown>).cancelled === 'true';
           if (isCancelled) continue;
 
-          try {
-            const flipRequest = await flip.getAbsenceRequestByExternalId(
-              String(absence.id)
+          // a) Try to find matching leave request by dates → use lr.id as external_id
+          const dateKey = `${absence.start_date}|${absence.end_date}`;
+          const matchingLRs = leaveRequestsByDate.get(dateKey) || [];
+
+          let approvedViaLR = false;
+
+          for (const matchingLR of matchingLRs) {
+            const externalId = String(matchingLR.id);
+            if (processedExternalIds.has(externalId)) continue;
+
+            try {
+              const flipRequest = await flip.getAbsenceRequestByExternalId(externalId);
+
+              console.log(
+                `[ApprovalStatus] Lookup by lr.id ${externalId}: ` +
+                  `found Flip request ${flipRequest.id}, status=${flipRequest.status}`
+              );
+
+              if (flipRequest && flipRequest.status === 'PENDING') {
+                console.log(
+                  `[ApprovalStatus] Absence ${absence.id} exists → ` +
+                    `leave request ${matchingLR.id} approved in BreatheHR → ` +
+                    `approving Flip request ${flipRequest.id}`
+                );
+
+                await flip.approveAbsenceRequest(mapping.flipUserId, {
+                  external_id: externalId,
+                });
+
+                approvedCount++;
+                processedExternalIds.add(externalId);
+                details.push(
+                  `approved: LR ${matchingLR.id} / absence ${absence.id} → ` +
+                    `Flip ${flipRequest.id} (${absence.start_date} - ${absence.end_date})`
+                );
+                console.log(
+                  `[ApprovalStatus] ✓ Approved in Flip — notification sent`
+                );
+
+                approvedViaLR = true;
+                break; // Don't try other LRs for this absence
+              }
+            } catch (lookupError) {
+              console.log(
+                `[ApprovalStatus] No Flip request found for lr.id ${externalId}: ` +
+                  `${lookupError instanceof Error ? lookupError.message : 'not found'}`
+              );
+            }
+          }
+
+          // b) Fallback: try absence.id as external_id
+          if (!approvedViaLR) {
+            const absenceExternalId = String(absence.id);
+            if (!processedExternalIds.has(absenceExternalId)) {
+              try {
+                const flipRequest = await flip.getAbsenceRequestByExternalId(absenceExternalId);
+
+                console.log(
+                  `[ApprovalStatus] Lookup by absence.id ${absenceExternalId}: ` +
+                    `found Flip request ${flipRequest.id}, status=${flipRequest.status}`
+                );
+
+                if (flipRequest && flipRequest.status === 'PENDING') {
+                  console.log(
+                    `[ApprovalStatus] Found PENDING Flip request by absence ID ${absence.id} → approving`
+                  );
+
+                  await flip.approveAbsenceRequest(mapping.flipUserId, {
+                    external_id: absenceExternalId,
+                  });
+
+                  approvedCount++;
+                  processedExternalIds.add(absenceExternalId);
+                  details.push(
+                    `approved: absence ${absence.id} → Flip ${flipRequest.id} ` +
+                      `(${absence.start_date} - ${absence.end_date})`
+                  );
+                  console.log(
+                    `[ApprovalStatus] ✓ Approved absence ${absence.id} in Flip — notification sent`
+                  );
+                }
+              } catch {
+                // No matching Flip request by absence ID — expected for most absences
+              }
+            }
+          }
+        }
+
+        // ---------------------------------------------------------------
+        // STEP 2: REJECTION DETECTION (from leave requests)
+        // ---------------------------------------------------------------
+        // Rejected leave requests stay in BreatheHR's leave_requests endpoint
+        // with status "denied" (BreatheHR's term for rejected).
+        // We call Flip's reject endpoint to trigger the rejection notification.
+        //
+        // Also check for rejection reasons/comments from the manager to
+        // include in the Flip update.
+        // ---------------------------------------------------------------
+
+        for (const lr of leaveRequests) {
+          const rawStatus = ((lr.status || '') as string).toLowerCase();
+          const rawAction = ((lr.action || '') as string).toLowerCase();
+
+          console.log(
+            `[ApprovalStatus] Leave request ${lr.id}: ` +
+              `status="${lr.status}", action="${lr.action}"`
+          );
+
+          // Check if rejected
+          const isRejected =
+            rawStatus === 'rejected' ||
+            rawStatus === 'declined' ||
+            rawStatus === 'denied' ||
+            rawAction === 'reject' ||
+            rawAction === 'decline' ||
+            rawAction === 'declined' ||
+            rawAction === 'denied' ||
+            rawAction === 'deny';
+
+          if (!isRejected) {
+            if (rawStatus === 'pending' || rawStatus === '' || !rawStatus) {
+              stillPending++;
+            }
+            continue;
+          }
+
+          const externalId = String(lr.id);
+          if (processedExternalIds.has(externalId)) continue;
+
+          // Log all fields for denied leave requests (helps debug what
+          // rejection reason fields BreatheHR provides)
+          console.log(
+            `[ApprovalStatus] DENIED leave request ${lr.id} raw data: ` +
+              JSON.stringify(lr, null, 2)
+          );
+
+          // Try to find the manager's rejection reason/comment
+          // BreatheHR may use various field names for this
+          const raw = lr as Record<string, unknown>;
+          const rejectionReason =
+            (raw.rejection_reason as string) ||
+            (raw.declined_reason as string) ||
+            (raw.reject_reason as string) ||
+            (raw.reviewer_notes as string) ||
+            (raw.reviewer_comment as string) ||
+            (raw.manager_comment as string) ||
+            (raw.manager_notes as string) ||
+            (raw.approver_comment as string) ||
+            (raw.reason as string) ||
+            (raw.denial_reason as string) ||
+            null;
+
+          if (rejectionReason) {
+            console.log(
+              `[ApprovalStatus] Rejection reason for LR ${lr.id}: "${rejectionReason}"`
             );
+          }
+
+          try {
+            const flipRequest = await flip.getAbsenceRequestByExternalId(externalId);
+
+            console.log(
+              `[ApprovalStatus] Rejection lookup by lr.id ${externalId}: ` +
+                `found Flip request ${flipRequest.id}, status=${flipRequest.status}`
+            );
+
+            if (!flipRequest || flipRequest.status !== 'PENDING') {
+              // Already processed
+              continue;
+            }
+
+            console.log(
+              `[ApprovalStatus] Leave request ${lr.id} rejected in BreatheHR → ` +
+                `rejecting Flip request ${flipRequest.id}`
+            );
+
+            await flip.rejectAbsenceRequest(mapping.flipUserId, {
+              external_id: externalId,
+            });
+
+            rejectedCount++;
+            processedExternalIds.add(externalId);
+            details.push(
+              `rejected: LR ${lr.id} → Flip ${flipRequest.id}` +
+                (rejectionReason ? ` (reason: ${rejectionReason})` : '')
+            );
+            console.log(
+              `[ApprovalStatus] ✗ Rejected in Flip — notification sent`
+            );
+
+            // If there's a rejection reason, store it for the absence sync
+            // to include in the requestor_comment field
+            if (rejectionReason) {
+              console.log(
+                `[ApprovalStatus] Rejection reason available: "${rejectionReason}". ` +
+                  `This will be included in the absence sync's requestor_comment.`
+              );
+            }
+          } catch (lookupError) {
+            console.log(
+              `[ApprovalStatus] No Flip request found for rejected lr.id ${externalId}: ` +
+                `${lookupError instanceof Error ? lookupError.message : 'not found'}`
+            );
+          }
+        }
+
+        // ---------------------------------------------------------------
+        // STEP 3 (secondary): Check for approved leave requests by status
+        // ---------------------------------------------------------------
+        // Some BreatheHR setups may keep approved leave requests visible
+        // with status="approved". This is a secondary check in case
+        // the absence-based detection (Step 1) missed something.
+        // ---------------------------------------------------------------
+
+        for (const lr of leaveRequests) {
+          const rawStatus = ((lr.status || '') as string).toLowerCase();
+          const rawAction = ((lr.action || '') as string).toLowerCase();
+
+          const isApproved =
+            rawStatus === 'approved' ||
+            rawAction === 'approve' ||
+            rawAction === 'approved';
+
+          if (!isApproved) continue;
+
+          const externalId = String(lr.id);
+          if (processedExternalIds.has(externalId)) continue;
+
+          try {
+            const flipRequest = await flip.getAbsenceRequestByExternalId(externalId);
 
             if (flipRequest && flipRequest.status === 'PENDING') {
               console.log(
-                `[ApprovalStatus] Found PENDING Flip request by absence ID ${absence.id} → approving`
+                `[ApprovalStatus] (secondary) Leave request ${lr.id} has status "approved" → ` +
+                  `approving Flip request ${flipRequest.id}`
               );
 
               await flip.approveAbsenceRequest(mapping.flipUserId, {
-                external_id: String(absence.id),
+                external_id: externalId,
               });
 
               approvedCount++;
+              processedExternalIds.add(externalId);
               details.push(
-                `approved: absence ${absence.id} (${absence.start_date} - ${absence.end_date})`
+                `approved (via LR status): LR ${lr.id} → Flip ${flipRequest.id} ` +
+                  `(${lr.start_date} - ${lr.end_date})`
               );
               console.log(
-                `[ApprovalStatus] ✓ Approved absence ${absence.id} in Flip`
+                `[ApprovalStatus] ✓ Approved in Flip (secondary) — notification sent`
               );
             }
           } catch {
-            // No matching Flip request by absence ID — expected for most
+            // No matching Flip request
           }
         }
       } catch (error) {
@@ -271,58 +401,5 @@ export default async function handler(
       error: 'Approval status check failed',
       message: error instanceof Error ? error.message : 'Unknown error',
     });
-  }
-}
-
-/**
- * After approving a Flip absence request, update its external_id from the
- * BreatheHR leave_request.id to the BreatheHR absence.id.
- *
- * This prevents the bulk absence sync from creating a duplicate entry
- * (since the sync uses absence IDs, not leave request IDs).
- */
-async function reconcileExternalId(
-  flip: FlipClient,
-  flipRequestId: string,
-  leaveRequest: { id: number; start_date: string; end_date: string },
-  absences: BreatheAbsence[],
-  employeeId: number
-): Promise<void> {
-  // Find the BreatheHR absence that matches this leave request's dates
-  const matchingAbsence = absences.find(
-    (a) =>
-      a.start_date === leaveRequest.start_date &&
-      a.end_date === leaveRequest.end_date &&
-      !((a as Record<string, unknown>).cancelled === true ||
-        (a as Record<string, unknown>).cancelled === 'true')
-  );
-
-  if (matchingAbsence) {
-    console.log(
-      `[ApprovalStatus] Reconciling external_id: ` +
-        `leave_request ${leaveRequest.id} → absence ${matchingAbsence.id} ` +
-        `(${leaveRequest.start_date} - ${leaveRequest.end_date})`
-    );
-
-    try {
-      await flip.patchAbsenceRequestExternalId(
-        flipRequestId,
-        String(matchingAbsence.id)
-      );
-      console.log(
-        `[ApprovalStatus] ✓ Updated external_id to ${matchingAbsence.id}`
-      );
-    } catch (error) {
-      console.warn(
-        `[ApprovalStatus] Could not update external_id: ` +
-          `${error instanceof Error ? error.message : error}`
-      );
-    }
-  } else {
-    console.log(
-      `[ApprovalStatus] No matching absence found for leave request ${leaveRequest.id} ` +
-        `(employee ${employeeId}, ${leaveRequest.start_date} - ${leaveRequest.end_date}). ` +
-        `The absence may not exist yet. Will reconcile on next cron run.`
-    );
   }
 }

@@ -292,6 +292,9 @@ function mapBreatheAbsenceToFlipSync(
  * Used for leave requests that haven't become absences yet (still pending)
  * or were rejected/denied. Including these in the sync prevents the
  * full-replacement lifecycle from destroying webhook-created Flip entries.
+ *
+ * For REJECTED leave requests, we try to find and append the manager's
+ * rejection reason to the requestor_comment so it's visible in Flip.
  */
 function mapLeaveRequestToFlipSync(
   lr: BreatheLeaveRequest,
@@ -307,6 +310,17 @@ function mapLeaveRequestToFlipSync(
     ? 'FIRST_HALF'
     : undefined;
 
+  // Build the comment — for rejected requests, append any manager rejection reason
+  let comment = lr.notes || null;
+  if (status === 'REJECTED') {
+    const rejectionReason = extractRejectionReason(lr);
+    if (rejectionReason) {
+      comment = comment
+        ? `${comment}\n\n--- Manager's reason: ${rejectionReason}`
+        : `Manager's reason: ${rejectionReason}`;
+    }
+  }
+
   return {
     id: null,
     external_id: String(lr.id),
@@ -316,7 +330,7 @@ function mapLeaveRequestToFlipSync(
     policy: {
       external_id: 'annual_leave',
     },
-    requestor_comment: lr.notes || null,
+    requestor_comment: comment,
     status,
     last_updated: lr.updated_at || null,
     starts_from: {
@@ -328,4 +342,30 @@ function mapLeaveRequestToFlipSync(
       type: endsAtType,
     },
   };
+}
+
+/**
+ * Extract the manager's rejection reason from a BreatheHR leave request.
+ *
+ * BreatheHR may use various field names for this. We check all known
+ * possibilities. The [key: string]: unknown index signature on the
+ * BreatheLeaveRequest type allows accessing additional fields.
+ */
+function extractRejectionReason(lr: BreatheLeaveRequest): string | null {
+  const raw = lr as Record<string, unknown>;
+  const reason =
+    (raw.rejection_reason as string) ||
+    (raw.declined_reason as string) ||
+    (raw.reject_reason as string) ||
+    (raw.denial_reason as string) ||
+    (raw.reviewer_notes as string) ||
+    (raw.reviewer_comment as string) ||
+    (raw.manager_comment as string) ||
+    (raw.manager_notes as string) ||
+    (raw.approver_comment as string) ||
+    (raw.reason as string) ||
+    (raw.comment as string) ||
+    null;
+
+  return reason && reason.trim() ? reason.trim() : null;
 }

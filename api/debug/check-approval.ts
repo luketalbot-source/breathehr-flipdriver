@@ -12,6 +12,10 @@ import { UserMappingService } from '../../lib/user-mapping';
  * - BreatheHR absences and leave_requests for each mapped user
  * - Whether each has a matching Flip absence request
  * - The status of each Flip absence request
+ * - Full raw data for denied/rejected leave requests
+ *
+ * Also includes a "diagnosis" section explaining what the approval-status
+ * checker WOULD do for each entry.
  */
 export default async function handler(
   req: VercelRequest,
@@ -39,68 +43,131 @@ export default async function handler(
       const absences = await breathe.getAllEmployeeAbsences(mapping.breatheEmployeeId);
       const absenceChecks: Record<string, unknown>[] = [];
 
+      // Build leave request map for date matching
+      let leaveRequests: Array<Record<string, unknown>> = [];
+      try {
+        leaveRequests = await breathe.getAllEmployeeLeaveRequests(mapping.breatheEmployeeId) as Array<Record<string, unknown>>;
+      } catch (e) {
+        userReport.leaveRequestError = e instanceof Error ? e.message : String(e);
+      }
+
+      const leaveRequestsByDate = new Map<string, Array<Record<string, unknown>>>();
+      for (const lr of leaveRequests) {
+        if (lr.start_date && lr.end_date && lr.id) {
+          const key = `${lr.start_date}|${lr.end_date}`;
+          const existing = leaveRequestsByDate.get(key) || [];
+          existing.push(lr);
+          leaveRequestsByDate.set(key, existing);
+        }
+      }
+
       for (const absence of absences) {
+        const isCancelled =
+          (absence as Record<string, unknown>).cancelled === true ||
+          (absence as Record<string, unknown>).cancelled === 'true';
+
         const check: Record<string, unknown> = {
-          breathe_id: absence.id,
+          breathe_absence_id: absence.id,
           dates: `${absence.start_date} - ${absence.end_date}`,
-          cancelled: (absence as Record<string, unknown>).cancelled,
-          notes: (absence.notes || '').substring(0, 50),
+          cancelled: isCancelled,
+          notes: (absence.notes || '').substring(0, 80),
         };
 
-        // Try to find matching Flip absence request
-        try {
-          const flipRequest = await flip.getAbsenceRequestByExternalId(String(absence.id));
-          check.flip_request = {
-            id: flipRequest.id,
-            status: flipRequest.status,
-            external_id: flipRequest.external_id,
-            absentee: flipRequest.absentee,
-          };
-          check.action_needed = flipRequest.status === 'PENDING' ? 'APPROVE' : 'none';
-        } catch (e) {
-          check.flip_request = null;
-          check.flip_error = e instanceof Error ? e.message : String(e);
-          check.action_needed = 'none (no Flip request)';
+        // Find matching leave request by dates
+        const dateKey = `${absence.start_date}|${absence.end_date}`;
+        const matchingLRs = leaveRequestsByDate.get(dateKey) || [];
+        check.matching_leave_requests = matchingLRs.map((lr) => ({
+          id: lr.id,
+          status: lr.status,
+          action: lr.action,
+        }));
+
+        // Try Flip lookup by each matching lr.id
+        const flipLookups: Record<string, unknown>[] = [];
+        for (const matchingLR of matchingLRs) {
+          try {
+            const flipRequest = await flip.getAbsenceRequestByExternalId(String(matchingLR.id));
+            flipLookups.push({
+              lookup_by: `lr.id=${matchingLR.id}`,
+              flip_id: flipRequest.id,
+              flip_status: flipRequest.status,
+              flip_external_id: flipRequest.external_id,
+              action_needed: flipRequest.status === 'PENDING' && !isCancelled ? 'APPROVE' : 'none',
+            });
+          } catch {
+            flipLookups.push({
+              lookup_by: `lr.id=${matchingLR.id}`,
+              flip_request: null,
+            });
+          }
         }
 
+        // Also try by absence.id
+        try {
+          const flipRequest = await flip.getAbsenceRequestByExternalId(String(absence.id));
+          flipLookups.push({
+            lookup_by: `absence.id=${absence.id}`,
+            flip_id: flipRequest.id,
+            flip_status: flipRequest.status,
+            flip_external_id: flipRequest.external_id,
+            action_needed: flipRequest.status === 'PENDING' && !isCancelled ? 'APPROVE' : 'none',
+          });
+        } catch {
+          flipLookups.push({
+            lookup_by: `absence.id=${absence.id}`,
+            flip_request: null,
+          });
+        }
+
+        check.flip_lookups = flipLookups;
         absenceChecks.push(check);
       }
       userReport.absences = absenceChecks;
 
-      // Check leave requests
-      try {
-        const leaveRequests = await breathe.getAllEmployeeLeaveRequests(mapping.breatheEmployeeId);
-        const lrChecks: Record<string, unknown>[] = [];
+      // Check leave requests — show full raw data for denied ones
+      const lrChecks: Record<string, unknown>[] = [];
+      for (const lr of leaveRequests) {
+        const status = ((lr.status as string) || '').toLowerCase();
+        const isDenied =
+          status === 'denied' ||
+          status === 'rejected' ||
+          status === 'declined';
 
-        for (const lr of leaveRequests) {
-          const check: Record<string, unknown> = {
-            breathe_id: lr.id,
-            dates: `${lr.start_date} - ${lr.end_date}`,
-            status: lr.status,
-            action: lr.action,
-            notes: (lr.notes || '').substring(0, 50),
-          };
-
-          // Try to find matching Flip absence request
-          try {
-            const flipRequest = await flip.getAbsenceRequestByExternalId(String(lr.id));
-            check.flip_request = {
-              id: flipRequest.id,
-              status: flipRequest.status,
-              external_id: flipRequest.external_id,
-            };
-          } catch (e) {
-            check.flip_request = null;
-          }
-
-          lrChecks.push(check);
-        }
-        userReport.leaveRequests = lrChecks;
-      } catch (e) {
-        userReport.leaveRequests = {
-          error: e instanceof Error ? e.message : String(e),
+        const check: Record<string, unknown> = {
+          breathe_lr_id: lr.id,
+          dates: `${lr.start_date} - ${lr.end_date}`,
+          status: lr.status,
+          action: lr.action,
+          notes: ((lr.notes as string) || '').substring(0, 80),
         };
+
+        // For denied leave requests, include ALL raw fields so we can
+        // discover what field BreatheHR uses for rejection reasons
+        if (isDenied) {
+          check.raw_data = lr;
+        }
+
+        // Try to find matching Flip absence request
+        try {
+          const flipRequest = await flip.getAbsenceRequestByExternalId(String(lr.id));
+          check.flip_request = {
+            id: flipRequest.id,
+            status: flipRequest.status,
+            external_id: flipRequest.external_id,
+            action_needed:
+              flipRequest.status === 'PENDING' && isDenied
+                ? 'REJECT'
+                : flipRequest.status === 'PENDING'
+                  ? 'pending (awaiting BreatheHR decision)'
+                  : 'none',
+          };
+        } catch {
+          check.flip_request = null;
+        }
+
+        lrChecks.push(check);
       }
+      userReport.leaveRequests = lrChecks;
 
       report.push(userReport);
     }
