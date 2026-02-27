@@ -5,32 +5,55 @@ import { FlipClient } from '../../lib/flip';
  * Debug endpoint to test the approve flow end-to-end
  *
  * GET /api/debug/test-approve?external_id=40810846
+ * GET /api/debug/test-approve?external_id=40810846&approver_id=OTHER_USER_ID
+ * GET /api/debug/test-approve?list_users=true
  *
  * 1. Looks up the Flip request by external_id
  * 2. Shows the current status
- * 3. If PENDING, attempts to approve and shows the result
- * 4. If already APPROVED, tries to approve anyway and shows the error/result
+ * 3. If not dry_run, attempts to approve and shows the result
  *
- * Also includes a "dry_run" mode (?dry_run=true) that only does the lookup.
+ * Use approver_id to test with a DIFFERENT approver than the absentee
+ * (to verify if self-approval suppresses notifications).
+ *
+ * Use list_users=true to see all available Flip users.
  */
 export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ): Promise<void> {
   try {
+    const flip = new FlipClient();
+
+    // List users mode
+    if (req.query.list_users === 'true') {
+      const allUsers = await flip.getAllUsers();
+      const users = allUsers.map((u) => ({
+        id: u.id,
+        name: `${u.first_name} ${u.last_name}`,
+        email: u.email,
+        status: u.status,
+        role: u.role,
+      }));
+      res.status(200).json({ users });
+      return;
+    }
+
     const externalId = req.query.external_id as string;
     const dryRun = req.query.dry_run === 'true';
-    const userId = (req.query.user_id as string) || '3d32eb7a-65d7-4f45-8b48-5de62a92adc5';
+    // Allow overriding the approver to test with a different user
+    const approverId = (req.query.approver_id as string) ||
+      (req.query.user_id as string) ||
+      '3d32eb7a-65d7-4f45-8b48-5de62a92adc5';
 
     if (!externalId) {
-      res.status(400).json({ error: 'Missing external_id query parameter' });
+      res.status(400).json({ error: 'Missing external_id query parameter. Use ?list_users=true to see available users.' });
       return;
     }
 
     const flip = new FlipClient();
     const result: Record<string, unknown> = {
       external_id: externalId,
-      user_id: userId,
+      approver_id: approverId,
       dry_run: dryRun,
     };
 
@@ -50,10 +73,10 @@ export default async function handler(
       // Step 2: Try to approve (if not dry run)
       if (!dryRun) {
         console.log(`[TestApprove] Attempting to approve...`);
-        console.log(`[TestApprove] Sending: approver=${userId}, identifier.external_id=${externalId}`);
+        console.log(`[TestApprove] Sending: approver=${approverId}, identifier.external_id=${externalId}`);
 
         try {
-          await flip.approveAbsenceRequest(userId, {
+          await flip.approveAbsenceRequest(approverId, {
             external_id: externalId,
           });
           result.approve_result = 'SUCCESS (200)';
@@ -67,7 +90,7 @@ export default async function handler(
         // Also try with absence_request_id instead of external_id
         console.log(`[TestApprove] Also trying with absence_request_id=${flipRequest.id}`);
         try {
-          await flip.approveAbsenceRequest(userId, {
+          await flip.approveAbsenceRequest(approverId, {
             absence_request_id: flipRequest.id,
           });
           result.approve_by_id_result = 'SUCCESS (200)';
