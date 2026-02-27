@@ -43,7 +43,6 @@ export default async function handler(
       return;
     }
 
-    const flip = new FlipClient();
     const result: Record<string, unknown> = {
       external_id: externalId,
       approver_id: approverId,
