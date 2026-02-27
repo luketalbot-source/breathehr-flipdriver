@@ -41,9 +41,10 @@ export default async function handler(
     const externalId = req.query.external_id as string;
     const dryRun = req.query.dry_run === 'true';
     // Allow overriding the approver to test with a different user
+    // Default: Luke's Flip manager (NOT Luke himself — self-approval may suppress notifications)
     const approverId = (req.query.approver_id as string) ||
       (req.query.user_id as string) ||
-      '3d32eb7a-65d7-4f45-8b48-5de62a92adc5';
+      '9348a095-68c2-4c99-aaca-e82c1b29b8a8';
 
     if (!externalId) {
       res.status(400).json({ error: 'Missing external_id query parameter. Use ?list_users=true to see available users.' });

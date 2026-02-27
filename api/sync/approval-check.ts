@@ -4,6 +4,54 @@ import { FlipClient } from '../../lib/flip';
 import { UserMappingService } from '../../lib/user-mapping';
 
 /**
+ * Resolve the approver for a given Flip user.
+ *
+ * Looks up the user's "manger_id" attribute in Flip. If not found,
+ * falls back to a hardcoded admin user. The approver MUST be different
+ * from the absentee to ensure push notifications are triggered.
+ */
+async function resolveApprover(
+  flip: FlipClient,
+  flipUserId: string,
+  managerCache: Map<string, string>
+): Promise<string> {
+  // Check cache first
+  if (managerCache.has(flipUserId)) {
+    return managerCache.get(flipUserId)!;
+  }
+
+  try {
+    const user = await flip.getUser(flipUserId);
+    // Flip returns attributes as an array of {name, value} objects
+    const attrs = user.attributes as Array<{ name: string; value: string }> | undefined;
+    if (attrs && Array.isArray(attrs)) {
+      const managerAttr = attrs.find(
+        (a) => a.name === 'manger_id' || a.name === 'manager_id'
+      );
+      if (managerAttr?.value) {
+        console.log(
+          `[ApprovalCheck] Resolved manager for ${flipUserId}: ${managerAttr.value}`
+        );
+        managerCache.set(flipUserId, managerAttr.value);
+        return managerAttr.value;
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `[ApprovalCheck] Could not look up manager for ${flipUserId}:`,
+      err instanceof Error ? err.message : err
+    );
+  }
+
+  // Fallback: use the absentee themselves (less ideal but won't break)
+  console.warn(
+    `[ApprovalCheck] No manager found for ${flipUserId}, falling back to self-approval`
+  );
+  managerCache.set(flipUserId, flipUserId);
+  return flipUserId;
+}
+
+/**
  * Approval Check — Lightweight polling endpoint
  *
  * GET/POST /api/sync/approval-check
@@ -16,12 +64,18 @@ import { UserMappingService } from '../../lib/user-mapping';
  * handles data consistency via Flip's bulk sync lifecycle. The bulk sync
  * does NOT trigger notifications — only the approve/reject endpoints do.
  *
+ * IMPORTANT: The approver must NOT be the same as the absentee.
+ * Self-approval may suppress notifications. We look up the user's
+ * manager (from Flip user attributes "manger_id") and use them as
+ * the approver. Falls back to a hardcoded admin if no manager is found.
+ *
  * Flow:
  * 1. Get all mapped users (Flip ↔ BreatheHR)
  * 2. For each user, fetch their BreatheHR leave requests
  * 3. Find leave requests that are "approved" or "denied" (with action=request)
  * 4. Look up the corresponding Flip absence request by external_id
- * 5. If the Flip request is still PENDING → call approve/reject endpoint
+ * 5. Resolve the user's Flip manager to use as approver
+ * 6. If the Flip request is still PENDING → call approve/reject endpoint
  *    (this triggers the push notification in Flip)
  */
 export default async function handler(
@@ -46,6 +100,9 @@ export default async function handler(
       `[ApprovalCheck] Checking ${mappings.length} mapped users`
     );
 
+    // Cache manager lookups to avoid repeated API calls
+    const managerCache = new Map<string, string>();
+
     let approved = 0;
     let rejected = 0;
     let checked = 0;
@@ -56,6 +113,7 @@ export default async function handler(
       breathe_status: string;
       flip_status: string;
       action: string;
+      approver?: string;
       error?: string;
     }> = [];
 
@@ -103,49 +161,60 @@ export default async function handler(
           // Only count items that have a Flip counterpart
           checked++;
 
-            // 4. If Flip request is still PENDING, trigger the notification
-            if (flipRequest.status === 'PENDING') {
-              if (isApproved) {
-                console.log(
-                  `[ApprovalCheck] 🔔 Approving Flip request ` +
-                    `(ext=${externalId}, flip=${flipRequest.id}) — ` +
-                    `BreatheHR approved, Flip still PENDING`
-                );
+          // 4. If Flip request is still PENDING, trigger the notification
+          if (flipRequest.status === 'PENDING') {
+            // 5. Resolve the approver — must be the manager, NOT the absentee
+            const approverId = await resolveApprover(
+              flip,
+              mapping.flipUserId,
+              managerCache
+            );
 
-                await flip.approveAbsenceRequest(mapping.flipUserId, {
-                  external_id: externalId,
-                });
+            if (isApproved) {
+              console.log(
+                `[ApprovalCheck] 🔔 Approving Flip request ` +
+                  `(ext=${externalId}, flip=${flipRequest.id}) — ` +
+                  `BreatheHR approved, Flip still PENDING. ` +
+                  `Approver: ${approverId} (absentee: ${mapping.flipUserId})`
+              );
 
-                approved++;
-                actions.push({
-                  external_id: externalId,
-                  breathe_status: lrStatus,
-                  flip_status: 'PENDING',
-                  action: 'APPROVED',
-                });
-              } else if (isRejected) {
-                console.log(
-                  `[ApprovalCheck] 🔔 Rejecting Flip request ` +
-                    `(ext=${externalId}, flip=${flipRequest.id}) — ` +
-                    `BreatheHR denied, Flip still PENDING`
-                );
+              await flip.approveAbsenceRequest(approverId, {
+                external_id: externalId,
+              });
 
-                await flip.rejectAbsenceRequest(mapping.flipUserId, {
-                  external_id: externalId,
-                });
+              approved++;
+              actions.push({
+                external_id: externalId,
+                breathe_status: lrStatus,
+                flip_status: 'PENDING',
+                action: 'APPROVED',
+                approver: approverId,
+              });
+            } else if (isRejected) {
+              console.log(
+                `[ApprovalCheck] 🔔 Rejecting Flip request ` +
+                  `(ext=${externalId}, flip=${flipRequest.id}) — ` +
+                  `BreatheHR denied, Flip still PENDING. ` +
+                  `Approver: ${approverId} (absentee: ${mapping.flipUserId})`
+              );
 
-                rejected++;
-                actions.push({
-                  external_id: externalId,
-                  breathe_status: lrStatus,
-                  flip_status: 'PENDING',
-                  action: 'REJECTED',
-                });
-              }
-            } else {
-              // Already processed — Flip status matches BreatheHR decision
-              skipped++;
+              await flip.rejectAbsenceRequest(approverId, {
+                external_id: externalId,
+              });
+
+              rejected++;
+              actions.push({
+                external_id: externalId,
+                breathe_status: lrStatus,
+                flip_status: 'PENDING',
+                action: 'REJECTED',
+                approver: approverId,
+              });
             }
+          } else {
+            // Already processed — Flip status matches BreatheHR decision
+            skipped++;
+          }
         }
       } catch (userErr) {
         console.error(
