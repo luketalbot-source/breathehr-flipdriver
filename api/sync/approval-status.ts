@@ -102,12 +102,16 @@ export default async function handler(
             );
 
             // Check if rejected
+            // BreatheHR uses "denied" (not "rejected" or "declined")
             const isRejected =
               status === 'rejected' ||
               status === 'declined' ||
+              status === 'denied' ||
               action === 'reject' ||
               action === 'decline' ||
-              action === 'declined';
+              action === 'declined' ||
+              action === 'denied' ||
+              action === 'deny';
 
             // Check if approved
             const isApproved =

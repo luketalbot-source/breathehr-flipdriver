@@ -14,16 +14,19 @@ import type {
  *
  * POST /api/sync/absences
  *
- * Uses Flip's sync lifecycle:
- * 1. Start sync → get sync_id
- * 2. Push absence request items
- * 3. Complete sync
+ * Uses Flip's sync lifecycle (start → push → complete).
+ * The sync is a FULL REPLACEMENT — items not in the push data get removed.
  *
- * IMPORTANT: For absences created via our webhook (Flip → BreatheHR),
- * the Flip absence request's external_id is the BreatheHR leave_request.id
- * (NOT the absence.id). When syncing, we use the leave_request.id as
- * external_id for these absences so the sync preserves the webhook-created
- * entries and doesn't create duplicates.
+ * CRITICAL: We must include ALL states in the sync data:
+ * - APPROVED absences (from BreatheHR absences endpoint)
+ * - PENDING leave requests (still awaiting manager approval)
+ * - REJECTED/DENIED leave requests
+ * - CANCELLED absences
+ *
+ * If we only push approved absences, PENDING and REJECTED Flip entries
+ * created via the webhook get destroyed by the sync, which means:
+ * - The approval-status checker can never find them to trigger notifications
+ * - Rejected requests silently disappear instead of showing as rejected
  */
 export default async function handler(
   req: VercelRequest,
@@ -59,31 +62,41 @@ export default async function handler(
     syncId = syncResult.sync_id;
     console.log(`[SyncAbsences] Started sync: ${syncId}`);
 
-    // 4. Fetch absences from BreatheHR and build sync items
+    // 4. Fetch absences AND leave requests, build sync items
     const syncItems: FlipSyncAbsenceRequest[] = [];
-    let successCount = 0;
+    const seenExternalIds = new Set<string>();
+    let absenceCount = 0;
+    let pendingCount = 0;
+    let rejectedCount = 0;
     let errorCount = 0;
 
     for (const mapping of mappings) {
       try {
+        // Fetch both absences and leave requests
         const absences = await breathe.getAllEmployeeAbsences(
           mapping.breatheEmployeeId
         );
-
-        // Also fetch leave requests to build a date→leave_request_id map.
-        // This ensures the sync uses the same external_id as the webhook-
-        // created Flip entries (which use leave_request.id, not absence.id).
-        const leaveRequestMap = await buildLeaveRequestMap(
-          breathe,
+        const leaveRequests = await breathe.getAllEmployeeLeaveRequests(
           mapping.breatheEmployeeId
         );
 
+        // Build date→leave_request_id map for external_id matching
+        const leaveRequestMap = new Map<string, BreatheLeaveRequest>();
+        for (const lr of leaveRequests) {
+          if (lr.start_date && lr.end_date && lr.id) {
+            const key = `${lr.start_date}|${lr.end_date}`;
+            leaveRequestMap.set(key, lr);
+          }
+        }
+
         console.log(
-          `[SyncAbsences] Found ${absences.length} absences, ` +
-            `${leaveRequestMap.size} leave request mappings ` +
-            `for employee ${mapping.breatheEmployeeId}`
+          `[SyncAbsences] Employee ${mapping.breatheEmployeeId}: ` +
+            `${absences.length} absences, ${leaveRequests.length} leave requests`
         );
 
+        // ----------------------------------------------------------
+        // A) Sync ABSENCES (approved/cancelled leave)
+        // ----------------------------------------------------------
         for (const absence of absences) {
           const syncItem = mapBreatheAbsenceToFlipSync(
             absence,
@@ -91,21 +104,67 @@ export default async function handler(
             policyByExternalId,
             leaveRequestMap
           );
-          if (syncItem) {
+          if (syncItem && syncItem.external_id) {
             syncItems.push(syncItem);
-            successCount++;
-            console.log(
-              `[SyncAbsences] Mapped absence ${absence.id}: ` +
-                `${absence.start_date} - ${absence.end_date}, ` +
-                `status=${syncItem.status}, ` +
-                `external_id=${syncItem.external_id}, ` +
-                `policy=${syncItem.policy.external_id}`
+            seenExternalIds.add(syncItem.external_id);
+            absenceCount++;
+          }
+        }
+
+        // ----------------------------------------------------------
+        // B) Sync PENDING and DENIED leave requests
+        // ----------------------------------------------------------
+        // These don't appear in the absences endpoint but must be
+        // included in the sync to preserve webhook-created Flip entries.
+        for (const lr of leaveRequests) {
+          const lrStatus = ((lr.status || '') as string).toLowerCase();
+          const externalId = String(lr.id);
+
+          // Skip if already included via an absence (approved leave requests
+          // become absences and are handled in section A)
+          if (seenExternalIds.has(externalId)) continue;
+
+          if (lrStatus === 'pending') {
+            // Include PENDING leave requests so they're preserved in Flip
+            const syncItem = mapLeaveRequestToFlipSync(
+              lr,
+              mapping.flipUserId,
+              'PENDING'
             );
+            if (syncItem) {
+              syncItems.push(syncItem);
+              seenExternalIds.add(externalId);
+              pendingCount++;
+              console.log(
+                `[SyncAbsences] Including PENDING leave request ${lr.id}: ` +
+                  `${lr.start_date} - ${lr.end_date}`
+              );
+            }
+          } else if (
+            lrStatus === 'denied' ||
+            lrStatus === 'rejected' ||
+            lrStatus === 'declined'
+          ) {
+            // Include REJECTED leave requests so users see the rejection
+            const syncItem = mapLeaveRequestToFlipSync(
+              lr,
+              mapping.flipUserId,
+              'REJECTED'
+            );
+            if (syncItem) {
+              syncItems.push(syncItem);
+              seenExternalIds.add(externalId);
+              rejectedCount++;
+              console.log(
+                `[SyncAbsences] Including REJECTED leave request ${lr.id}: ` +
+                  `${lr.start_date} - ${lr.end_date}`
+              );
+            }
           }
         }
       } catch (error) {
         console.error(
-          `[SyncAbsences] Error fetching absences for employee ${mapping.breatheEmployeeId}:`,
+          `[SyncAbsences] Error fetching data for employee ${mapping.breatheEmployeeId}:`,
           error
         );
         errorCount++;
@@ -124,14 +183,21 @@ export default async function handler(
 
     // 6. Complete the sync
     await flip.completeAbsenceRequestSync(syncId);
+
+    const totalSynced = absenceCount + pendingCount + rejectedCount;
     console.log(
-      `[SyncAbsences] Sync complete. Synced: ${successCount}, Errors: ${errorCount}`
+      `[SyncAbsences] Sync complete. ` +
+        `Absences: ${absenceCount}, Pending: ${pendingCount}, ` +
+        `Rejected: ${rejectedCount}, Total: ${totalSynced}, Errors: ${errorCount}`
     );
 
     res.status(200).json({
       status: 'ok',
       sync_id: syncId,
-      synced: successCount,
+      synced: totalSynced,
+      absences: absenceCount,
+      pending: pendingCount,
+      rejected: rejectedCount,
       errors: errorCount,
     });
   } catch (error) {
@@ -156,40 +222,6 @@ export default async function handler(
 }
 
 /**
- * Build a map from (start_date|end_date) → leave_request.id
- *
- * This is used to determine the correct external_id for the sync.
- * When a leave request was created via our webhook, the Flip absence
- * request's external_id is the leave_request.id. We need to use the
- * same ID in the sync so Flip matches them correctly.
- */
-async function buildLeaveRequestMap(
-  breathe: BreatheHRClient,
-  employeeId: number
-): Promise<Map<string, number>> {
-  const map = new Map<string, number>();
-
-  try {
-    const leaveRequests = await breathe.getAllEmployeeLeaveRequests(employeeId);
-
-    for (const lr of leaveRequests) {
-      if (lr.start_date && lr.end_date && lr.id) {
-        // Use dates as the key to match against absences
-        const key = `${lr.start_date}|${lr.end_date}`;
-        map.set(key, lr.id);
-      }
-    }
-  } catch (error) {
-    console.log(
-      `[SyncAbsences] Could not fetch leave requests for employee ${employeeId}: ` +
-        `${error instanceof Error ? error.message : error}`
-    );
-  }
-
-  return map;
-}
-
-/**
  * Map a BreatheHR absence to Flip's sync format
  *
  * Uses leave_request.id as external_id when a matching leave request
@@ -199,34 +231,19 @@ function mapBreatheAbsenceToFlipSync(
   absence: BreatheAbsence,
   flipUserId: string,
   policyByExternalId: Map<string, string>,
-  leaveRequestMap: Map<string, number>
+  leaveRequestMap: Map<string, BreatheLeaveRequest>
 ): FlipSyncAbsenceRequest | null {
-  // Map the status
-  // BreatheHR doesn't have a "status" field — absences use a "cancelled" boolean
   const isCancelled =
     (absence as Record<string, unknown>).cancelled === true ||
     (absence as Record<string, unknown>).cancelled === 'true';
   const status: AbsenceRequestStatus = isCancelled ? 'CANCELLED' : 'APPROVED';
 
-  // Determine the external_id
-  // If there's a matching leave request, use its ID (matches webhook-created entries)
-  // Otherwise use the absence ID
+  // Use leave_request.id as external_id when available (matches webhook entries)
   const dateKey = `${absence.start_date}|${absence.end_date}`;
-  const leaveRequestId = leaveRequestMap.get(dateKey);
-  const externalId = leaveRequestId
-    ? String(leaveRequestId)
-    : String(absence.id);
-
-  if (leaveRequestId) {
-    console.log(
-      `[SyncAbsences] Using leave_request.id ${leaveRequestId} as external_id ` +
-        `(instead of absence.id ${absence.id}) for ${absence.start_date} - ${absence.end_date}`
-    );
-  }
+  const matchingLR = leaveRequestMap.get(dateKey);
+  const externalId = matchingLR ? String(matchingLR.id) : String(absence.id);
 
   // Determine the policy
-  // If the absence has a leave_reason, try to find the matching Flip policy
-  // Otherwise default to "annual_leave"
   let policyExternalId = 'annual_leave';
   if (absence.leave_reason) {
     const leaveReasonId =
@@ -237,12 +254,11 @@ function mapBreatheAbsenceToFlipSync(
     }
   }
 
-  // Map half-day information
   const startsFromType = absence.half_start ? 'SECOND_HALF' : undefined;
   const endsAtType = absence.half_end ? 'FIRST_HALF' : undefined;
 
   return {
-    id: null, // New item, let Flip assign ID
+    id: null,
     external_id: externalId,
     approver: null,
     absentee: flipUserId,
@@ -265,6 +281,50 @@ function mapBreatheAbsenceToFlipSync(
       date: absence.end_date
         ? `${absence.end_date}T00:00:00`
         : absence.end_date,
+      type: endsAtType,
+    },
+  };
+}
+
+/**
+ * Map a BreatheHR leave request (pending or rejected) to Flip's sync format
+ *
+ * Used for leave requests that haven't become absences yet (still pending)
+ * or were rejected/denied. Including these in the sync prevents the
+ * full-replacement lifecycle from destroying webhook-created Flip entries.
+ */
+function mapLeaveRequestToFlipSync(
+  lr: BreatheLeaveRequest,
+  flipUserId: string,
+  status: AbsenceRequestStatus
+): FlipSyncAbsenceRequest | null {
+  if (!lr.start_date || !lr.end_date) return null;
+
+  const startsFromType = (lr.half_start || lr.start_half_day)
+    ? 'SECOND_HALF'
+    : undefined;
+  const endsAtType = (lr.half_end || lr.end_half_day)
+    ? 'FIRST_HALF'
+    : undefined;
+
+  return {
+    id: null,
+    external_id: String(lr.id),
+    approver: null,
+    absentee: flipUserId,
+    duration: undefined,
+    policy: {
+      external_id: 'annual_leave',
+    },
+    requestor_comment: lr.notes || null,
+    status,
+    last_updated: lr.updated_at || null,
+    starts_from: {
+      date: `${lr.start_date}T00:00:00`,
+      type: startsFromType,
+    },
+    ends_at: {
+      date: `${lr.end_date}T00:00:00`,
       type: endsAtType,
     },
   };
