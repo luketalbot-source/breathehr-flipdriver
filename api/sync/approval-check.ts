@@ -83,17 +83,25 @@ export default async function handler(
           if (!isApproved && !isRejected) continue;
 
           const externalId = String(lr.id);
-          checked++;
 
           // 3. Look up the corresponding Flip absence request
+          // Many BreatheHR leave requests won't have Flip counterparts
+          // (created in BreatheHR directly, not via Flip webhook) — skip silently
+          let flipRequest;
           try {
-            const flipRequest =
+            flipRequest =
               await flip.getAbsenceRequestByExternalId(externalId);
+          } catch {
+            // Not found in Flip — skip silently
+            continue;
+          }
 
-            if (!flipRequest || !flipRequest.status) {
-              skipped++;
-              continue;
-            }
+          if (!flipRequest || !flipRequest.status) {
+            continue;
+          }
+
+          // Only count items that have a Flip counterpart
+          checked++;
 
             // 4. If Flip request is still PENDING, trigger the notification
             if (flipRequest.status === 'PENDING') {
@@ -138,11 +146,6 @@ export default async function handler(
               // Already processed — Flip status matches BreatheHR decision
               skipped++;
             }
-          } catch (flipErr) {
-            // Not found in Flip — this leave request wasn't created via webhook
-            // (e.g., it was created directly in BreatheHR, not through Flip)
-            skipped++;
-          }
         }
       } catch (userErr) {
         console.error(
