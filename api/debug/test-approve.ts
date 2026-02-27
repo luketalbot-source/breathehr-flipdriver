@@ -24,17 +24,17 @@ export default async function handler(
   try {
     const flip = new FlipClient();
 
-    // List users mode
+    // List users mode — fetch first page only to avoid timeout
     if (req.query.list_users === 'true') {
-      const allUsers = await flip.getAllUsers();
-      const users = allUsers.map((u) => ({
+      const result = await flip.searchUsers({ limit: 50 });
+      const users = (result.users || []).map((u: Record<string, unknown>) => ({
         id: u.id,
-        name: `${u.first_name} ${u.last_name}`,
+        name: `${u.first_name || ''} ${u.last_name || ''}`.trim(),
         email: u.email,
         status: u.status,
         role: u.role,
       }));
-      res.status(200).json({ users });
+      res.status(200).json({ count: users.length, users });
       return;
     }
 
