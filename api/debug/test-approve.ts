@@ -25,8 +25,15 @@ export default async function handler(
     const flip = new FlipClient();
 
     // List users mode — fetch first page only to avoid timeout
+    // Use ?list_users=true or ?list_users=true&search=luke to search
     if (req.query.list_users === 'true') {
-      const result = await flip.searchUsers({ limit: 20 });
+      const searchTerm = req.query.search as string | undefined;
+      const page = parseInt(req.query.page as string, 10) || 1;
+      const result = await flip.searchUsers({
+        searchTerm,
+        page,
+        limit: 20,
+      });
       res.status(200).json(result);
       return;
     }
