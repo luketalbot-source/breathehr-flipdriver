@@ -181,56 +181,80 @@ export default async function handler(
 
     let notifApproved = 0;
     let notifRejected = 0;
+    const notifChecks: Array<Record<string, unknown>> = [];
 
-    for (const item of syncItems) {
-      if (!item.external_id) continue;
+    const itemsToCheck = syncItems.filter(
+      (item) =>
+        item.external_id &&
+        (item.status === 'APPROVED' || item.status === 'REJECTED')
+    );
 
-      // Only check items we're about to push as APPROVED or REJECTED
-      if (item.status !== 'APPROVED' && item.status !== 'REJECTED') continue;
+    console.log(
+      `[SyncAbsences] Notification check: ${itemsToCheck.length} APPROVED/REJECTED items to check`
+    );
+
+    for (const item of itemsToCheck) {
+      const checkResult: Record<string, unknown> = {
+        external_id: item.external_id,
+        sync_status: item.status,
+      };
 
       try {
         const flipRequest = await flip.getAbsenceRequestByExternalId(
-          item.external_id
+          item.external_id!
+        );
+
+        checkResult.flip_id = flipRequest.id;
+        checkResult.flip_status = flipRequest.status;
+        checkResult.flip_updated_at = (flipRequest as Record<string, unknown>).updated_at;
+
+        console.log(
+          `[SyncAbsences] Notification check: external_id=${item.external_id} ` +
+            `→ flip_status=${flipRequest.status} (pushing ${item.status})`
         );
 
         if (flipRequest && flipRequest.status === 'PENDING') {
           if (item.status === 'APPROVED') {
             console.log(
               `[SyncAbsences] 🔔 Flip request ${flipRequest.id} is PENDING, ` +
-                `about to push APPROVED → calling approve endpoint for notification ` +
-                `(external_id: ${item.external_id})`
+                `calling approve endpoint (external_id: ${item.external_id})`
             );
 
             await flip.approveAbsenceRequest(item.absentee, {
-              external_id: item.external_id,
+              external_id: item.external_id!,
             });
 
             notifApproved++;
+            checkResult.action = 'APPROVED_WITH_NOTIFICATION';
             console.log(
               `[SyncAbsences] ✓ Approved ${item.external_id} — notification sent!`
             );
           } else if (item.status === 'REJECTED') {
             console.log(
               `[SyncAbsences] 🔔 Flip request ${flipRequest.id} is PENDING, ` +
-                `about to push REJECTED → calling reject endpoint for notification ` +
-                `(external_id: ${item.external_id})`
+                `calling reject endpoint (external_id: ${item.external_id})`
             );
 
             await flip.rejectAbsenceRequest(item.absentee, {
-              external_id: item.external_id,
+              external_id: item.external_id!,
             });
 
             notifRejected++;
+            checkResult.action = 'REJECTED_WITH_NOTIFICATION';
             console.log(
               `[SyncAbsences] ✗ Rejected ${item.external_id} — notification sent!`
             );
           }
+        } else {
+          checkResult.action = 'SKIPPED_NOT_PENDING';
         }
-      } catch {
-        // No matching Flip request for this external_id — expected for
-        // absences that weren't created via the webhook (e.g., pre-existing
-        // absences or manually created entries). The sync will create them.
+      } catch (err) {
+        checkResult.flip_status = 'NOT_FOUND';
+        checkResult.action = 'SKIPPED_NO_FLIP_REQUEST';
+        checkResult.error = err instanceof Error ? err.message : String(err);
       }
+
+      notifChecks.push(checkResult);
     }
 
     if (notifApproved > 0 || notifRejected > 0) {
@@ -276,6 +300,7 @@ export default async function handler(
       notifications: {
         approved: notifApproved,
         rejected: notifRejected,
+        checks: notifChecks,
       },
       errors: errorCount,
     });
