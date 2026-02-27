@@ -9,8 +9,14 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
  * be triggered manually. It runs syncs in the correct order:
  * 1. Policies (must exist before balances/absences can reference them)
  * 2. Balances
- * 3. Approval status check (uses approve/reject endpoints → triggers notifications)
- * 4. Absences (bulk sync for historical consistency)
+ * 3. Absences (includes notification triggering for PENDING→APPROVED/REJECTED)
+ *
+ * Note: The absence sync now handles notification triggering internally.
+ * Before running the bulk sync, it checks each APPROVED/REJECTED item
+ * against the Flip API. If the Flip request is still PENDING, it calls
+ * the approve/reject endpoint to trigger the notification, then proceeds
+ * with the sync. This eliminates the race condition that existed when
+ * notification checking was a separate step.
  */
 export default async function handler(
   req: VercelRequest,
@@ -28,7 +34,7 @@ export default async function handler(
     console.log('[SyncAll] Starting full sync...');
 
     // 1. Sync policies
-    console.log('[SyncAll] Step 1/4: Syncing policies...');
+    console.log('[SyncAll] Step 1/3: Syncing policies...');
     try {
       const policyRes = await fetch(`${baseUrl}/api/sync/policies`, {
         method: 'POST',
@@ -43,7 +49,7 @@ export default async function handler(
     }
 
     // 2. Sync balances
-    console.log('[SyncAll] Step 2/4: Syncing balances...');
+    console.log('[SyncAll] Step 2/3: Syncing balances...');
     try {
       const balanceRes = await fetch(`${baseUrl}/api/sync/balances`, {
         method: 'POST',
@@ -57,27 +63,12 @@ export default async function handler(
       console.error('[SyncAll] Balances sync failed:', error);
     }
 
-    // 3. Check approval status (BEFORE absence sync)
-    // This uses Flip's approve/reject endpoints which trigger user notifications.
-    // Must run before the bulk sync so that the approve/reject calls go through
-    // while the requests are still PENDING.
-    console.log('[SyncAll] Step 3/4: Checking approval status...');
-    try {
-      const approvalRes = await fetch(`${baseUrl}/api/sync/approval-status`, {
-        method: 'POST',
-      });
-      results.approval_status = await approvalRes.json();
-      console.log('[SyncAll] Approval status result:', results.approval_status);
-    } catch (error) {
-      results.approval_status = {
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-      console.error('[SyncAll] Approval status check failed:', error);
-    }
-
-    // 4. Sync absences (bulk sync for historical consistency)
-    // This updates all absence data but does NOT trigger notifications.
-    console.log('[SyncAll] Step 4/4: Syncing absences...');
+    // 3. Sync absences (includes notification triggering)
+    // The absence sync now internally checks for PENDING Flip requests
+    // that should be APPROVED/REJECTED and calls the approve/reject
+    // endpoints BEFORE running the bulk sync, so notifications are
+    // triggered atomically with the data sync.
+    console.log('[SyncAll] Step 3/3: Syncing absences (with notifications)...');
     try {
       const absenceRes = await fetch(`${baseUrl}/api/sync/absences`, {
         method: 'POST',

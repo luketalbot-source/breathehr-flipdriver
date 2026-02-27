@@ -17,16 +17,18 @@ import type {
  * Uses Flip's sync lifecycle (start → push → complete).
  * The sync is a FULL REPLACEMENT — items not in the push data get removed.
  *
- * CRITICAL: We must include ALL states in the sync data:
- * - APPROVED absences (from BreatheHR absences endpoint)
- * - PENDING leave requests (still awaiting manager approval)
- * - REJECTED/DENIED leave requests
- * - CANCELLED absences
+ * NOTIFICATION STRATEGY:
+ * Flip's bulk sync does NOT trigger user notifications.
+ * Only the individual approve/reject endpoints send notifications.
  *
- * If we only push approved absences, PENDING and REJECTED Flip entries
- * created via the webhook get destroyed by the sync, which means:
- * - The approval-status checker can never find them to trigger notifications
- * - Rejected requests silently disappear instead of showing as rejected
+ * To solve this, BEFORE running the sync, we check each item that would
+ * be pushed as APPROVED or REJECTED. If the corresponding Flip request
+ * is still PENDING, we call the approve/reject endpoint FIRST to trigger
+ * the notification, then include it in the sync for data consistency.
+ *
+ * This eliminates the race condition that existed when the approval check
+ * was a separate cron step — a previous sync could change PENDING→APPROVED
+ * before the next approval check ran.
  */
 export default async function handler(
   req: VercelRequest,
@@ -57,12 +59,7 @@ export default async function handler(
       policies.filter((p) => p.external_id).map((p) => [p.external_id!, p.id])
     );
 
-    // 3. Start the sync in Flip
-    const syncResult = await flip.startAbsenceRequestSync();
-    syncId = syncResult.sync_id;
-    console.log(`[SyncAbsences] Started sync: ${syncId}`);
-
-    // 4. Fetch absences AND leave requests, build sync items
+    // 3. Fetch absences AND leave requests, build sync items
     const syncItems: FlipSyncAbsenceRequest[] = [];
     const seenExternalIds = new Set<string>();
     let absenceCount = 0;
@@ -171,7 +168,83 @@ export default async function handler(
       }
     }
 
-    // 5. Push items in batches
+    // ================================================================
+    // 4. TRIGGER NOTIFICATIONS for PENDING→APPROVED/REJECTED transitions
+    // ================================================================
+    // BEFORE running the sync, check each APPROVED/REJECTED item.
+    // If the Flip request is currently PENDING, call the approve/reject
+    // endpoint to trigger the user notification.
+    //
+    // This MUST happen before the sync because the sync would change
+    // PENDING→APPROVED without triggering a notification.
+    // ================================================================
+
+    let notifApproved = 0;
+    let notifRejected = 0;
+
+    for (const item of syncItems) {
+      if (!item.external_id) continue;
+
+      // Only check items we're about to push as APPROVED or REJECTED
+      if (item.status !== 'APPROVED' && item.status !== 'REJECTED') continue;
+
+      try {
+        const flipRequest = await flip.getAbsenceRequestByExternalId(
+          item.external_id
+        );
+
+        if (flipRequest && flipRequest.status === 'PENDING') {
+          if (item.status === 'APPROVED') {
+            console.log(
+              `[SyncAbsences] 🔔 Flip request ${flipRequest.id} is PENDING, ` +
+                `about to push APPROVED → calling approve endpoint for notification ` +
+                `(external_id: ${item.external_id})`
+            );
+
+            await flip.approveAbsenceRequest(item.absentee, {
+              external_id: item.external_id,
+            });
+
+            notifApproved++;
+            console.log(
+              `[SyncAbsences] ✓ Approved ${item.external_id} — notification sent!`
+            );
+          } else if (item.status === 'REJECTED') {
+            console.log(
+              `[SyncAbsences] 🔔 Flip request ${flipRequest.id} is PENDING, ` +
+                `about to push REJECTED → calling reject endpoint for notification ` +
+                `(external_id: ${item.external_id})`
+            );
+
+            await flip.rejectAbsenceRequest(item.absentee, {
+              external_id: item.external_id,
+            });
+
+            notifRejected++;
+            console.log(
+              `[SyncAbsences] ✗ Rejected ${item.external_id} — notification sent!`
+            );
+          }
+        }
+      } catch {
+        // No matching Flip request for this external_id — expected for
+        // absences that weren't created via the webhook (e.g., pre-existing
+        // absences or manually created entries). The sync will create them.
+      }
+    }
+
+    if (notifApproved > 0 || notifRejected > 0) {
+      console.log(
+        `[SyncAbsences] Notifications triggered: ${notifApproved} approved, ${notifRejected} rejected`
+      );
+    }
+
+    // 5. Start the sync in Flip
+    const syncResult = await flip.startAbsenceRequestSync();
+    syncId = syncResult.sync_id;
+    console.log(`[SyncAbsences] Started sync: ${syncId}`);
+
+    // 6. Push items in batches
     const batchSize = 100;
     for (let i = 0; i < syncItems.length; i += batchSize) {
       const batch = syncItems.slice(i, i + batchSize);
@@ -181,14 +254,16 @@ export default async function handler(
       );
     }
 
-    // 6. Complete the sync
+    // 7. Complete the sync
     await flip.completeAbsenceRequestSync(syncId);
 
     const totalSynced = absenceCount + pendingCount + rejectedCount;
     console.log(
       `[SyncAbsences] Sync complete. ` +
         `Absences: ${absenceCount}, Pending: ${pendingCount}, ` +
-        `Rejected: ${rejectedCount}, Total: ${totalSynced}, Errors: ${errorCount}`
+        `Rejected: ${rejectedCount}, Total: ${totalSynced}, ` +
+        `Notifications: ${notifApproved} approved / ${notifRejected} rejected, ` +
+        `Errors: ${errorCount}`
     );
 
     res.status(200).json({
@@ -198,6 +273,10 @@ export default async function handler(
       absences: absenceCount,
       pending: pendingCount,
       rejected: rejectedCount,
+      notifications: {
+        approved: notifApproved,
+        rejected: notifRejected,
+      },
       errors: errorCount,
     });
   } catch (error) {
@@ -347,9 +426,9 @@ function mapLeaveRequestToFlipSync(
 /**
  * Extract the manager's rejection reason from a BreatheHR leave request.
  *
- * BreatheHR may use various field names for this. We check all known
- * possibilities. The [key: string]: unknown index signature on the
- * BreatheLeaveRequest type allows accessing additional fields.
+ * BreatheHR has a `reason` field on leave requests. We check that plus
+ * other possible field names. The [key: string]: unknown index signature
+ * on the BreatheLeaveRequest type allows accessing additional fields.
  */
 function extractRejectionReason(lr: BreatheLeaveRequest): string | null {
   const raw = lr as Record<string, unknown>;
