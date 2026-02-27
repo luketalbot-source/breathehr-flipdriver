@@ -8,6 +8,10 @@
     {
       "path": "/api/sync/all",
       "schedule": "*/30 * * * *"
+    },
+    {
+      "path": "/api/sync/approval-check",
+      "schedule": "*/2 * * * *"
     }
   ]
 }

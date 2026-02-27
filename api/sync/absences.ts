@@ -17,18 +17,10 @@ import type {
  * Uses Flip's sync lifecycle (start → push → complete).
  * The sync is a FULL REPLACEMENT — items not in the push data get removed.
  *
- * NOTIFICATION STRATEGY:
- * Flip's bulk sync does NOT trigger user notifications.
- * Only the individual approve/reject endpoints send notifications.
- *
- * To solve this, BEFORE running the sync, we check each item that would
- * be pushed as APPROVED or REJECTED. If the corresponding Flip request
- * is still PENDING, we call the approve/reject endpoint FIRST to trigger
- * the notification, then include it in the sync for data consistency.
- *
- * This eliminates the race condition that existed when the approval check
- * was a separate cron step — a previous sync could change PENDING→APPROVED
- * before the next approval check ran.
+ * DATA ONLY — no notification responsibility.
+ * Notifications are handled by /api/sync/approval-check which runs
+ * every 2 minutes and calls the Flip approve/reject endpoints.
+ * This sync only ensures data consistency between BreatheHR and Flip.
  */
 export default async function handler(
   req: VercelRequest,
@@ -169,99 +161,12 @@ export default async function handler(
     }
 
     // ================================================================
-    // 4. TRIGGER NOTIFICATIONS for PENDING→APPROVED/REJECTED transitions
+    // 4. NOTIFICATIONS are handled by /api/sync/approval-check
     // ================================================================
-    // BEFORE running the sync, check each APPROVED/REJECTED item.
-    // If the Flip request is currently PENDING, call the approve/reject
-    // endpoint to trigger the user notification.
-    //
-    // This MUST happen before the sync because the sync would change
-    // PENDING→APPROVED without triggering a notification.
+    // The approval-check endpoint runs every 2 minutes (via Vercel cron)
+    // and calls the Flip approve/reject endpoints when BreatheHR status
+    // changes. This sync only handles data consistency via bulk push.
     // ================================================================
-
-    let notifApproved = 0;
-    let notifRejected = 0;
-    const notifChecks: Array<Record<string, unknown>> = [];
-
-    const itemsToCheck = syncItems.filter(
-      (item) =>
-        item.external_id &&
-        (item.status === 'APPROVED' || item.status === 'REJECTED')
-    );
-
-    console.log(
-      `[SyncAbsences] Notification check: ${itemsToCheck.length} APPROVED/REJECTED items to check`
-    );
-
-    for (const item of itemsToCheck) {
-      const checkResult: Record<string, unknown> = {
-        external_id: item.external_id,
-        sync_status: item.status,
-      };
-
-      try {
-        const flipRequest = await flip.getAbsenceRequestByExternalId(
-          item.external_id!
-        );
-
-        checkResult.flip_id = flipRequest.id;
-        checkResult.flip_status = flipRequest.status;
-        checkResult.flip_updated_at = (flipRequest as Record<string, unknown>).updated_at;
-
-        console.log(
-          `[SyncAbsences] Notification check: external_id=${item.external_id} ` +
-            `→ flip_status=${flipRequest.status} (pushing ${item.status})`
-        );
-
-        if (flipRequest && flipRequest.status === 'PENDING') {
-          if (item.status === 'APPROVED') {
-            console.log(
-              `[SyncAbsences] 🔔 Flip request ${flipRequest.id} is PENDING, ` +
-                `calling approve endpoint (external_id: ${item.external_id})`
-            );
-
-            await flip.approveAbsenceRequest(item.absentee, {
-              external_id: item.external_id!,
-            });
-
-            notifApproved++;
-            checkResult.action = 'APPROVED_WITH_NOTIFICATION';
-            console.log(
-              `[SyncAbsences] ✓ Approved ${item.external_id} — notification sent!`
-            );
-          } else if (item.status === 'REJECTED') {
-            console.log(
-              `[SyncAbsences] 🔔 Flip request ${flipRequest.id} is PENDING, ` +
-                `calling reject endpoint (external_id: ${item.external_id})`
-            );
-
-            await flip.rejectAbsenceRequest(item.absentee, {
-              external_id: item.external_id!,
-            });
-
-            notifRejected++;
-            checkResult.action = 'REJECTED_WITH_NOTIFICATION';
-            console.log(
-              `[SyncAbsences] ✗ Rejected ${item.external_id} — notification sent!`
-            );
-          }
-        } else {
-          checkResult.action = 'SKIPPED_NOT_PENDING';
-        }
-      } catch (err) {
-        checkResult.flip_status = 'NOT_FOUND';
-        checkResult.action = 'SKIPPED_NO_FLIP_REQUEST';
-        checkResult.error = err instanceof Error ? err.message : String(err);
-      }
-
-      notifChecks.push(checkResult);
-    }
-
-    if (notifApproved > 0 || notifRejected > 0) {
-      console.log(
-        `[SyncAbsences] Notifications triggered: ${notifApproved} approved, ${notifRejected} rejected`
-      );
-    }
 
     // 5. Start the sync in Flip
     const syncResult = await flip.startAbsenceRequestSync();
@@ -286,7 +191,6 @@ export default async function handler(
       `[SyncAbsences] Sync complete. ` +
         `Absences: ${absenceCount}, Pending: ${pendingCount}, ` +
         `Rejected: ${rejectedCount}, Total: ${totalSynced}, ` +
-        `Notifications: ${notifApproved} approved / ${notifRejected} rejected, ` +
         `Errors: ${errorCount}`
     );
 
@@ -297,11 +201,6 @@ export default async function handler(
       absences: absenceCount,
       pending: pendingCount,
       rejected: rejectedCount,
-      notifications: {
-        approved: notifApproved,
-        rejected: notifRejected,
-        checks: notifChecks,
-      },
       errors: errorCount,
     });
   } catch (error) {
