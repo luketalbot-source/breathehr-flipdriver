@@ -26,15 +26,8 @@ export default async function handler(
 
     // List users mode — fetch first page only to avoid timeout
     if (req.query.list_users === 'true') {
-      const result = await flip.searchUsers({ limit: 50 });
-      const users = (result.users || []).map((u: Record<string, unknown>) => ({
-        id: u.id,
-        name: `${u.first_name || ''} ${u.last_name || ''}`.trim(),
-        email: u.email,
-        status: u.status,
-        role: u.role,
-      }));
-      res.status(200).json({ count: users.length, users });
+      const result = await flip.searchUsers({ limit: 20 });
+      res.status(200).json(result);
       return;
     }
 
